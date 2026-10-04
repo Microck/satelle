@@ -167,6 +167,10 @@ pub(crate) fn admit_managed_codex_from_state_root(
 
 pub(crate) fn admit_managed_codex_for_current_process() -> Result<VerifiedCodexRuntime, SatelleError>
 {
+    tracing::debug!(
+        admission_stage = "resolve_paths",
+        "managed Codex admission stage"
+    );
     let current_directory =
         std::env::current_dir().map_err(|_| invalid_receipt("current_directory_unavailable"))?;
     let paths = resolve_path_set(&current_directory)?;
@@ -931,6 +935,10 @@ fn admit_managed_codex_from_state_root_for_target(
     state_root: &Path,
     expected_target: &str,
 ) -> Result<VerifiedCodexRuntime, SatelleError> {
+    tracing::debug!(
+        admission_stage = "receipt_read",
+        "managed Codex admission stage"
+    );
     let receipt_path = state_root.join(RECEIPT_FILE_NAME);
     let receipt_text = read_owner_only_secret_config_file(&receipt_path)
         .map_err(|_| invalid_receipt("receipt_missing_or_not_owner_only"))?;
@@ -945,7 +953,15 @@ fn admit_managed_codex_receipt(
     expected_target: &str,
     receipt: ManagedCodexReceipt,
 ) -> Result<VerifiedCodexRuntime, SatelleError> {
+    tracing::debug!(
+        admission_stage = "validate_metadata",
+        "managed Codex admission stage"
+    );
     validate_receipt_metadata(&receipt, expected_target)?;
+    tracing::debug!(
+        admission_stage = "canonical_directories",
+        "managed Codex admission stage"
+    );
     let codex_home = canonical_directory(&receipt.codex_home, "codex_home_invalid")?;
     let releases_root = canonical_directory(
         &state_root.join("codex").join("releases"),
@@ -963,6 +979,10 @@ fn admit_managed_codex_receipt(
     {
         return Err(invalid_receipt("immutable_package_root_invalid"));
     }
+    tracing::debug!(
+        admission_stage = "directory_security",
+        "managed Codex admission stage"
+    );
     verify_runtime_directories(&codex_home, &package_root)?;
 
     let expected_binary_path = package_root
@@ -971,12 +991,20 @@ fn admit_managed_codex_receipt(
     if !same_path_identity(&receipt.immutable_binary_path, &expected_binary_path) {
         return Err(invalid_receipt("immutable_binary_path_invalid"));
     }
+    tracing::debug!(
+        admission_stage = "binary_identity",
+        "managed Codex admission stage"
+    );
     let binary_path = verify_binary_identity(
         &receipt.immutable_binary_path,
         &package_root,
         &receipt.immutable_binary_sha256,
     )?;
 
+    tracing::debug!(
+        admission_stage = "admitted",
+        "managed Codex admission stage"
+    );
     Ok(VerifiedCodexRuntime {
         binary_path,
         codex_home,

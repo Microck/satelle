@@ -4488,7 +4488,7 @@ fn windows_task_xml(
             "<LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>",
             "<Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>",
             "<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>",
-            "<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><Enabled>true</Enabled></Settings>",
+            "<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><Enabled>true</Enabled><Priority>4</Priority></Settings>",
             "<Actions Context=\"Author\"><Exec><Command>{executable}</Command>",
             "<Arguments>{arguments}</Arguments></Exec></Actions></Task>"
         ),
@@ -4551,6 +4551,7 @@ fn windows_task_definition_match_expression_for_values(
             "([Security.Principal.SecurityIdentifier]::new({trigger_sid})).Translate(",
             "[Security.Principal.NTAccount]).Value)) -and ",
             "($root.Settings.MultipleInstancesPolicy -eq 'IgnoreNew') -and ",
+            "($root.Settings.Priority -eq '4') -and ",
             "($root.Settings.DisallowStartIfOnBatteries -eq 'false') -and ",
             "($root.Settings.StopIfGoingOnBatteries -eq 'false') -and ",
             "([String]::IsNullOrEmpty([string]$root.Settings.Enabled) -or ",
@@ -8669,6 +8670,7 @@ mod tests {
         assert!(xml.contains("<LogonType>InteractiveToken</LogonType>"));
         assert!(xml.contains("<RunLevel>LeastPrivilege</RunLevel>"));
         assert!(xml.contains("<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>"));
+        assert!(xml.contains("<Priority>4</Priority>"));
         assert!(xml.contains("--service-config C:\\Users\\operator"));
         assert!(!xml.contains("Password"));
         assert!(!xml.contains("HighestAvailable"));
@@ -8686,6 +8688,7 @@ mod tests {
         assert!(observe.contains("InteractiveToken"));
         assert!(observe.contains("LeastPrivilege"));
         assert!(observe.contains("IgnoreNew"));
+        assert!(observe.contains("$root.Settings.Priority -eq '4'"));
     }
 
     #[test]

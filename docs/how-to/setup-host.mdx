@@ -142,3 +142,18 @@ changes credentials, or treats another mutation phase as an uncommitted begin.
 A live owner, recent heartbeat, existing ledger run, unexpected execution marker,
 or changed claim stops recovery before archival. Re-run normal setup only after
 this exact recovery succeeds.
+
+## Inspect a stalled native runtime admission
+
+```sh
+satelle host start --foreground --error-format human --log-verbosity debug
+```
+
+Admission logs identify path resolution, receipt reads, metadata validation,
+directory checks, and binary verification. They do not print credentials,
+receipt contents, or filesystem paths. The last stage identifies the operation
+to investigate; it does not prove the cause of a stall.
+
+Windows interactive Host and bootstrap tasks run at normal scheduling priority.
+Runtime identity checks still hash the installed binary before native execution;
+they do not inherit Task Scheduler's default background priority.
