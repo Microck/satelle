@@ -766,7 +766,18 @@ fn session_id(stdout: &[u8]) -> String {
 
 fn completed_log_session(state: &TestStateDir) -> (String, std::path::PathBuf) {
     let cache = state.path().join("command-history-cache");
+    // Log fixtures reuse one daemon across several subprocesses. Keep it alive until
+    // CliStateDir releases it instead of racing the fake adapter's 250 ms idle timeout.
+    let config_file = state.path().join("command-history-config.toml");
+    let mut config = satelle::core::SatelleConfig::defaults();
+    config
+        .hosts
+        .get_mut("local-demo")
+        .expect("default config contains the local Host")
+        .daemon_idle_timeout = satelle::core::ExplicitDuration::parse("60s");
+    write_user_config(&config_file, toml::to_string(&config).unwrap()).unwrap();
     let run_output = satelle()
+        .env("SATELLE_CONFIG_FILE", &config_file)
         .env("SATELLE_STATE_DIR", state.path())
         .env("SATELLE_CACHE_DIR", &cache)
         .args(["run", "--host", "local-demo", "Open the browser"])
@@ -776,12 +787,14 @@ fn completed_log_session(state: &TestStateDir) -> (String, std::path::PathBuf) {
         .clone();
     let session = session_id(&run_output.stdout);
     satelle()
+        .env("SATELLE_CONFIG_FILE", &config_file)
         .env("SATELLE_STATE_DIR", state.path())
         .env("SATELLE_CACHE_DIR", &cache)
         .args(["steer", &session, "Continue"])
         .assert()
         .success();
     satelle()
+        .env("SATELLE_CONFIG_FILE", &config_file)
         .env("SATELLE_STATE_DIR", state.path())
         .env("SATELLE_CACHE_DIR", &cache)
         .args(["stop", &session])
