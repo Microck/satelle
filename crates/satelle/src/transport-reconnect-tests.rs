@@ -552,7 +552,7 @@ fn server_restart_reconciles_the_exact_attached_turn_once() {
 
 #[test]
 fn silent_terminal_event_loss_reconciles_without_waiting_for_socket_failure() {
-    let fixture = DirectFixture::start();
+    let mut fixture = DirectFixture::start();
     let mut stream = fixture.connect_host_stream();
     let admitted = fixture.complete_while_server_is_down("complete before event drain");
     let expected_session_id = admitted.session_id().clone();
@@ -573,6 +573,32 @@ fn silent_terminal_event_loss_reconciles_without_waiting_for_socket_failure() {
             .iter()
             .any(|event| event.event_type() == EventType::TurnCompleted),
         "the fixture must discard the real terminal event"
+    );
+
+    // Reconciliation timing must measure the event clock, not contention with the continuous
+    // SQLite writer below. Reuse exact authenticated responses from this real daemon through
+    // the existing HTTP fixture while keeping the real Host event stream and 500 ms deadline.
+    let session_response = fixture
+        .transport()
+        .client
+        .read_session(&expected_session_id)
+        .expect("read real terminal Session response");
+    let query = satelle::host::LogPageQuery::tail(10_000)
+        .expect("construct terminal logs query")
+        .with_session(expected_session_id.clone());
+    let logs_response = fixture
+        .transport()
+        .client
+        .logs(&query)
+        .expect("read real terminal logs response");
+    let reconciliation = ActiveReconciliationServer::start(
+        fixture.host_identity.clone(),
+        serde_json::to_value(session_response).expect("encode real terminal Session response"),
+        serde_json::to_value(logs_response).expect("encode real terminal logs response"),
+    );
+    fixture.replace_http_client(
+        reconciliation.address(),
+        "principal-cli-silent-terminal-reconciliation-test",
     );
 
     // Keep the Host-scoped socket busy with unrelated real Session events. An inactivity timeout
@@ -612,30 +638,31 @@ fn silent_terminal_event_loss_reconciles_without_waiting_for_socket_failure() {
         .expect("publish five unrelated real Sessions before reconciliation");
 
     let mut events = Vec::new();
-    let outcome = fixture
-        .transport()
-        .event_runtime
-        .block_on(async {
-            tokio::time::timeout(
-                Duration::from_millis(500),
-                fixture
-                    .transport()
-                    .follow_turn_with_reconciliation_interval(
-                        stream,
-                        admitted,
-                        Duration::from_millis(25),
-                        &mut |event| {
-                            events.push(event);
-                            Ok(())
-                        },
-                    ),
-            )
-            .await
-            .expect("unrelated Host traffic must not postpone reconciliation")
-        })
-        .expect("durable status must terminate a silent live stream");
+    let outcome = fixture.transport().event_runtime.block_on(async {
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            fixture
+                .transport()
+                .follow_turn_with_reconciliation_interval(
+                    stream,
+                    admitted,
+                    Duration::from_millis(25),
+                    &mut |event| {
+                        events.push(event);
+                        Ok(())
+                    },
+                ),
+        )
+        .await
+    });
+    // Stop the writer even when the latency assertion fails so this test cannot leak work
+    // into other concurrent fixtures.
     stop_noise.store(true, Ordering::Release);
     noise.join().expect("join unrelated event producer");
+    reconciliation.stop();
+    let outcome = outcome
+        .expect("unrelated Host traffic must not postpone reconciliation")
+        .expect("durable status must terminate a silent live stream");
 
     assert_eq!(outcome.session.session_id(), &expected_session_id);
     assert_eq!(outcome.turn_id, expected_turn_id);
