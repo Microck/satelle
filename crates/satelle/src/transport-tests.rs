@@ -1371,6 +1371,29 @@ fn setup_token_lock_serializes_processes_targeting_the_same_credential() {
 }
 
 #[test]
+fn setup_token_lock_owner_releases_with_a_duplicate_descriptor_open() {
+    let state = TestStateDir::new().expect("temporary state directory");
+    let token_path = state.path().join("inherited-setup.token");
+    let owner = acquire_setup_token_lock(&token_path).expect("acquire setup token ownership");
+    let inherited = owner
+        .0
+        .try_clone()
+        .expect("duplicate the shared file description");
+    let contender = open_setup_token_lock(&token_path).expect("open independent setup descriptor");
+    assert!(matches!(
+        contender.try_lock(),
+        Err(std::fs::TryLockError::WouldBlock)
+    ));
+
+    drop(owner);
+    contender
+        .try_lock()
+        .expect("dropping the Controller releases ownership before inherited descriptors close");
+    contender.unlock().expect("release new setup ownership");
+    drop(inherited);
+}
+
+#[test]
 fn ssh_setup_rerun_reuses_an_existing_secure_token_destination() {
     let temporary_root = tempfile::tempdir().expect("temporary root");
     #[cfg(unix)]

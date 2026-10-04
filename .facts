@@ -539,6 +539,10 @@
 - satelle setup maps --daemon-config-file, --daemon-state-dir, --daemon-cache-dir, and --daemon-log-dir to SATELLE_CONFIG_FILE, SATELLE_STATE_DIR, SATELLE_CACHE_DIR, and SATELLE_LOG_DIR in the planned Satelle-owned service configuration @spec @mvp @implemented
 - satelle setup accepts persistent daemon path override values from user-level host configuration and setup flags, with setup flags taking precedence @implemented @mvp
 - satelle setup does not inherit local SATELLE_HOME, SATELLE_CONFIG_FILE, SATELLE_STATE_DIR, SATELLE_CACHE_DIR, or SATELLE_LOG_DIR into daemon service configuration automatically @spec @mvp @implemented
+- id: stl
+  label: setup token ownership serializes one credential path and explicitly releases its file lock when the Controller owner drops, even while a duplicate descriptor remains open
+  command: cargo test --locked -p satelle --all-features --bin satelle setup_token_lock_
+  tags: [spec, contract, mvp, implemented]
 - id: l00
   label: satelle setup preserves daemon path override text until SSH detects the remote Host platform, then validates every override with that platform's path rules before constructing or applying a remote Host Daemon command
   command: cargo test --locked -p satelle --features test-support --bin satelle remote_daemon_path_overrides_ -- --test-threads=1
