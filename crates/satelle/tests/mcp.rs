@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 mod test_file;
 
 const SESSION_ID: &str = "rs_01890a5d-ac96-7b7c-8f89-37c3d0a66e11";
-const DIRECT_READ_CONNECTIONS: usize = 5;
+const DIRECT_READ_CONNECTIONS: usize = 6;
 const TEST_INFRASTRUCTURE_DEADLOCK_LIMIT: Duration = Duration::from_secs(30);
 
 struct ImmediateCloseEndpoint {
@@ -1071,7 +1071,7 @@ api_token = {{ kind = "file", path = {token_path} }}
     for (id, expected_code) in [
         (2, "host-unreachable"),
         (3, "host-unreachable"),
-        (4, "not-implemented"),
+        (4, "host-unreachable"),
         (5, "host-unreachable"),
         (6, "host-daemon-unreachable"),
         (7, "ssh-bootstrap-unavailable"),
