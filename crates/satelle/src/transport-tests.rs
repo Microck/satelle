@@ -5842,9 +5842,21 @@ fn forwarded_connection_closure_requires_remote_listener_absence_before_relaunch
             .expect_err("accepted connection closes without an HTTP response");
         server.join().unwrap();
         assert!(!error.is_connect());
-        if listener_state == "absent" {
+        // The remote probe is distinct from the local forwarded socket. Keep
+        // its absent port bound without listening so parallel tests cannot
+        // reuse it and turn a real connection refusal into a live listener.
+        let absent_remote = if listener_state == "absent" {
             drop(listener);
-        }
+            let socket = tokio::net::TcpSocket::new_v4().unwrap();
+            socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            Some(socket)
+        } else {
+            None
+        };
+        let remote_address = absent_remote
+            .as_ref()
+            .map(|socket| socket.local_addr().unwrap())
+            .unwrap_or(address);
 
         let ownership_confirmations = std::cell::Cell::new(0);
         let probe_calls = std::cell::Cell::new(0);
@@ -5862,9 +5874,13 @@ fn forwarded_connection_closure_requires_remote_listener_absence_before_relaunch
                         probe_calls.set(probe_calls.get() + 1);
                         match listener_state {
                             "absent" => {
+                                // The held TcpSocket has never listened. Prove
+                                // that its port also cannot be reassigned.
                                 assert_eq!(
-                                    std::net::TcpStream::connect(address).unwrap_err().kind(),
-                                    std::io::ErrorKind::ConnectionRefused
+                                    std::net::TcpListener::bind(remote_address)
+                                        .unwrap_err()
+                                        .kind(),
+                                    std::io::ErrorKind::AddrInUse
                                 );
                                 Ok(ssh_bootstrap::LoopbackListenerObservation::Absent)
                             }
