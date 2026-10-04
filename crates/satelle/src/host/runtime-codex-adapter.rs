@@ -4514,7 +4514,11 @@ mod tests {
                     provider_secret: None,
                     provider_credential_fingerprint: &provider_credential_fingerprint,
                     source: ProviderSmokeSource::Live,
-                    timeout_override: Some(Duration::from_secs(2)),
+                    timeout_override: Some(
+                        crate::host::codex_session::tests::process_startup_timeout(
+                            Duration::from_secs(2),
+                        ),
+                    ),
                 },
                 &mut persistence,
                 || {

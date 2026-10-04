@@ -949,7 +949,7 @@ fn wait_for(path: &Path) {
     }
 }
 
-fn process_startup_timeout(default: Duration) -> Duration {
+pub(crate) fn process_startup_timeout(default: Duration) -> Duration {
     // Native Windows and macOS runners need enough time to initialize the
     // fixture before a timeout test starts exercising active-turn cleanup.
     if cfg!(any(windows, target_os = "macos")) {
