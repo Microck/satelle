@@ -143,6 +143,7 @@ enum DirectoryTreeEntryKind {
 #[derive(Debug, Eq, PartialEq)]
 struct StableAccessMetadata {
     readonly: bool,
+    modified_at: std::time::SystemTime,
     #[cfg(unix)]
     mode: u32,
     #[cfg(unix)]
@@ -235,6 +236,7 @@ fn snapshot_directory_tree(root: &Path) -> std::io::Result<BTreeMap<PathBuf, Dir
         };
         let access = StableAccessMetadata {
             readonly: metadata.permissions().readonly(),
+            modified_at: metadata.modified()?,
             #[cfg(unix)]
             mode: metadata.mode(),
             #[cfg(unix)]
@@ -304,9 +306,8 @@ fn observe_transient_mutations(
                 // report its write as a metadata modification, so recognize the exact barrier
                 // path before applying protected-tree event suppression.
                 barrier_observed = is_barrier_signal(&event, expected_barrier_path);
-                if barrier_observed {
-                    continue;
-                }
+                // One event can include the barrier and protected paths. The
+                // barrier ends observation after every path in that event is checked.
                 let ignored = is_ignored_filesystem_event(event.kind);
                 if ignored {
                     continue;
@@ -347,9 +348,9 @@ fn observe_transient_mutations(
 ///
 /// Native filesystem events detect transient create, data, name, and remove mutations. Final
 /// snapshots record relative paths, entry kinds, regular-file bytes, symlink targets, and the
-/// stable access metadata exposed by the standard library. Symlinks are never followed. Access
-/// events, metadata-only events, and volatile timestamps are intentionally ignored because native
-/// backends report ordinary reads through platform-specific metadata event variants.
+/// access metadata and modification times exposed by the standard library. Symlinks are never
+/// followed. Reads can change access times, which remain excluded. Modification times retain
+/// evidence of writes whose bytes were restored before a native event was delivered.
 pub fn assert_directory_tree_unchanged<T>(
     operation: &str,
     root: impl AsRef<Path>,
@@ -1126,6 +1127,32 @@ mod tests {
         let wrong_path =
             Event::new(EventKind::Modify(ModifyKind::Any)).add_path(PathBuf::from("other-path"));
         assert!(!is_barrier_signal(&wrong_path, &barrier_path));
+    }
+
+    #[test]
+    fn mutation_barrier_keeps_data_changes_in_the_same_event() {
+        let root = PathBuf::from("protected-tree");
+        let barrier = PathBuf::from("completion-barrier");
+        let canary = root.join("transient-data.txt");
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(Ok(Event::new(EventKind::Modify(ModifyKind::Data(
+                DataChange::Content,
+            )))
+            .add_path(barrier.clone())
+            .add_path(canary)))
+            .expect("send combined filesystem event");
+        let changes = observe_transient_mutations(
+            "maintenance dry run",
+            &root,
+            &[&barrier],
+            &barrier,
+            &receiver,
+        );
+        assert_eq!(
+            changes,
+            BTreeSet::from([PathBuf::from("transient-data.txt")])
+        );
     }
 
     #[test]
