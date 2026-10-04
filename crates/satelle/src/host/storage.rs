@@ -1,4 +1,6 @@
 mod auth;
+#[path = "storage/bootstrap-recovery.rs"]
+pub(crate) mod bootstrap_recovery;
 mod codec;
 #[path = "storage/desktop-snapshot.rs"]
 mod desktop_snapshot;

@@ -393,6 +393,39 @@ pub(super) struct StateDirectory {
 }
 
 impl StateDirectory {
+    /// Move an owned child between pinned parents without replacing evidence.
+    pub(super) fn move_child_durable(
+        &self,
+        source: &str,
+        destination_directory: &Self,
+        destination: &str,
+    ) -> Result<(), StorageError> {
+        #[cfg(unix)]
+        {
+            rustix::fs::renameat_with(
+                &self.handle,
+                source,
+                &destination_directory.handle,
+                destination,
+                rustix::fs::RenameFlags::NOREPLACE,
+            )
+            .map_err(|source| {
+                if source == rustix::io::Errno::EXIST {
+                    StorageError::new(StorageErrorKind::StateConflict)
+                } else {
+                    StorageError::with_source(StorageErrorKind::OperationFailed, source)
+                }
+            })?;
+            self.sync_for(StorageErrorKind::OperationFailed)?;
+            destination_directory.sync_for(StorageErrorKind::OperationFailed)
+        }
+        #[cfg(windows)]
+        {
+            self.secure
+                .move_child_to(source, &destination_directory.secure, destination)
+        }
+    }
+
     #[cfg(unix)]
     fn sync(&self) -> Result<(), StorageError> {
         self.sync_for(StorageErrorKind::MigrationFailed)

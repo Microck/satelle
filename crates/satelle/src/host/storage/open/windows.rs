@@ -320,8 +320,17 @@ impl SecureStateDirectory {
         source_file_name: &str,
         destination_file_name: &str,
     ) -> Result<(), StorageError> {
+        self.move_child_to(source_file_name, self, destination_file_name)
+    }
+
+    pub(super) fn move_child_to(
+        &self,
+        source_file_name: &str,
+        destination_directory: &Self,
+        destination_file_name: &str,
+    ) -> Result<(), StorageError> {
         let source = wide_path(&self.leaf_path(source_file_name)?)?;
-        let destination = wide_path(&self.leaf_path(destination_file_name)?)?;
+        let destination = wide_path(&destination_directory.leaf_path(destination_file_name)?)?;
         let moved = unsafe {
             // Omitting MOVEFILE_REPLACE_EXISTING makes the unique tombstone or
             // failed-sidecar name a no-clobber destination. WRITE_THROUGH does
