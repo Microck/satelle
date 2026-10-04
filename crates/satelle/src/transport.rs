@@ -7500,11 +7500,21 @@ fn rollback_setup_token(
     })
 }
 
-fn acquire_setup_token_lock(token_path: &Path) -> Result<fs::File, SatelleError> {
+struct SetupTokenLock(fs::File);
+
+impl Drop for SetupTokenLock {
+    fn drop(&mut self) {
+        // A child between fork and exec can retain the shared file description. Unlock
+        // explicitly so ownership ends with this Controller, as it does for Storage.
+        let _ = self.0.unlock();
+    }
+}
+
+fn acquire_setup_token_lock(token_path: &Path) -> Result<SetupTokenLock, SatelleError> {
     let lock = open_setup_token_lock(token_path)?;
     lock.lock()
         .map_err(|error| setup_token_lock_error(token_path, error))?;
-    Ok(lock)
+    Ok(SetupTokenLock(lock))
 }
 
 fn open_setup_token_lock(token_path: &Path) -> Result<fs::File, SatelleError> {
