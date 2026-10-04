@@ -1183,8 +1183,8 @@ fn router(state: Arc<DaemonState>) -> Router {
             Arc::clone(&state),
             auth::require_control,
         ));
-    // These operations are used only by the managed local daemon. They keep
-    // setup and Doctor behind the same durable state owner as session control.
+    // These daemon-owned operations keep setup and Doctor behind the same
+    // durable state owner as session control.
     let local_setup_operation_route = Router::new()
         .route("/v1/local/setup", post(local_setup_operation))
         .route_layer(middleware::from_fn_with_state(

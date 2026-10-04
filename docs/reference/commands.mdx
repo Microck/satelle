@@ -45,9 +45,10 @@ Global options include `--no-color`, `--profile <name>`, and
 `setup` application is transport-specific. Local setup is dry-run planning.
 SSH setup applies the on-demand transport token handoff.
 
-Direct and SSH-tunneled transports support ordinary Session operations. Live
-`doctor` probes run locally; unsupported transport/scope combinations fail
-with a typed error.
+Direct and SSH-tunneled transports support ordinary Session operations and
+live `doctor` probes. Doctor runs on the authenticated Host that owns the
+runtime and readiness cache. It requires control scope; read-only tokens
+cannot run probes or refresh readiness.
 
 When an SSH-forwarded daemon connection closes or resets, Satelle checks the
 remote loopback listener while holding its bootstrap lock. A proven absent

@@ -7999,9 +7999,6 @@ impl TransportClient for DirectTransport {
         options: DoctorOptions,
         provider_intent: &satelle::host::ProviderComputerUseIntent,
     ) -> DoctorExecutionResult {
-        if self.mode != "local" {
-            return Err(DoctorExecutionFailure::from(self.unsupported("doctor")));
-        }
         self.client
             .local_doctor_operation(
                 &self.alias,

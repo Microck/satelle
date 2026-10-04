@@ -4887,6 +4887,69 @@ impl Drop for DirectFixture {
 }
 
 #[test]
+fn doctor_uses_the_authenticated_host_for_local_direct_and_ssh_transports() {
+    let scopes = DoctorScopeSelection::parse(&["computer-use".to_string()]).unwrap();
+    let controller_probe: Arc<dyn ControllerTransportProbe> =
+        Arc::new(crate::tailscale::transport_doctor_probe(
+            &scopes,
+            &SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST],
+        ));
+    for mode in ["local", "direct", "ssh"] {
+        let mut fixture = DirectFixture::start();
+        fixture.transport.as_mut().unwrap().mode = mode;
+        let report = fixture
+            .transport()
+            .doctor(
+                &scopes,
+                Arc::clone(&controller_probe),
+                DoctorOptions::new(true, Some(Duration::from_secs(5))).unwrap(),
+                &ProviderComputerUseIntent::host_default(),
+            )
+            .expect("authenticated Doctor request succeeds");
+        assert_eq!(report.host, "direct-test");
+        assert_eq!(report.scopes, ["computer-use"]);
+        // The fixture supports session preflight, but has no native refresh
+        // implementation. Doctor must return that Host finding over every mode.
+        assert!(!report.summary.ready);
+        assert_eq!(report.summary.blocking_findings, 1);
+        assert!(report.changed);
+        assert_eq!(report.probe_results.len(), 1);
+        assert_eq!(report.probe_results[0].cache_status, "refreshed_failed");
+        assert_eq!(
+            report.findings[0].finding_id,
+            "computer-use.native.refresh.failed"
+        );
+    }
+}
+
+#[test]
+fn remote_doctor_keeps_control_scope_authorization() {
+    let scopes = DoctorScopeSelection::parse(&["computer-use".to_string()]).unwrap();
+    let controller_probe: Arc<dyn ControllerTransportProbe> =
+        Arc::new(crate::tailscale::transport_doctor_probe(
+            &scopes,
+            &SatelleConfig::defaults().hosts[LOCAL_DEMO_HOST],
+        ));
+    for mode in ["direct", "ssh"] {
+        let mut fixture = DirectFixture::start_with_scopes(ApiScopes::READ);
+        fixture.transport.as_mut().unwrap().mode = mode;
+        let failure = fixture
+            .transport()
+            .doctor(
+                &scopes,
+                Arc::clone(&controller_probe),
+                DoctorOptions::default(),
+                &ProviderComputerUseIntent::host_default(),
+            )
+            .expect_err("read-only token cannot invoke Doctor");
+        assert_eq!(
+            failure.error.code,
+            ErrorCode::AuthorizationInsufficientScope
+        );
+    }
+}
+
+#[test]
 fn host_provider_validation_drives_conflicting_controller_projection() {
     let fixture = DirectFixture::start();
     let controller_selection = ProviderSelection {
