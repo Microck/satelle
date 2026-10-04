@@ -149,7 +149,9 @@ impl DaemonClient {
         let expected_host_identity = expected_host_identity.into();
         HeaderValue::from_str(&expected_host_identity)
             .map_err(|_| DaemonClientError::InvalidHostIdentityHeader)?;
-        let builder = Client::builder().redirect(Policy::none());
+        // Loopback is the local daemon or an authenticated SSH tunnel. Never
+        // send that transport or its bearer credential to an environment proxy.
+        let builder = Client::builder().no_proxy().redirect(Policy::none());
         let builder = match request_timeout {
             Some(timeout) => builder.timeout(timeout),
             None => builder,
@@ -1551,6 +1553,81 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::Arc;
+
+    #[test]
+    fn loopback_ignores_environment_proxies() {
+        const CHILD: &str = "SATELLE_LOOPBACK_PROXY_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // Isolate environment changes from the parallel test process.
+            let proxy = TcpListener::bind("127.0.0.1:0").expect("bind proxy trap");
+            proxy.set_nonblocking(true).expect("set nonblocking trap");
+            let proxy_url = format!("http://{}", proxy.local_addr().unwrap());
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child.args([
+                "--exact",
+                "transport::client::tests::loopback_ignores_environment_proxies",
+                "--nocapture",
+            ]);
+            child
+                .env(CHILD, "1")
+                .env_remove("NO_PROXY")
+                .env_remove("no_proxy");
+            for name in [
+                "HTTP_PROXY",
+                "http_proxy",
+                "HTTPS_PROXY",
+                "https_proxy",
+                "ALL_PROXY",
+                "all_proxy",
+            ] {
+                child.env(name, &proxy_url);
+            }
+            let output = child.output().expect("run isolated proxy test");
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+            assert!(
+                matches!(proxy.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+            );
+            return;
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local daemon fixture");
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept direct client");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut request = [0; 4096];
+            assert!(stream.read(&mut request).unwrap() > 0);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\ndirect",
+                )
+                .unwrap();
+        });
+        let client = DaemonClient::loopback_with_timeout(
+            address,
+            ApiBearerToken::generate().unwrap(),
+            "host-proxy-test",
+            Duration::from_secs(3),
+        )
+        .unwrap();
+        // Exercise the configured transport over a real socket independently
+        // of the API response schema, which has its own conformance coverage.
+        let body = client
+            .client
+            .get(&client.base_url)
+            .send()
+            .unwrap()
+            .text()
+            .unwrap();
+        assert_eq!(body, "direct");
+        server.join().unwrap();
+    }
 
     #[test]
     fn provider_binding_path_encodes_each_alias_as_one_segment() {
