@@ -3,6 +3,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 
@@ -17,6 +18,138 @@ const DAEMON_PATH_ENVIRONMENT_VARIABLES: [&str; 5] = [
     "SATELLE_CACHE_DIR",
     "SATELLE_LOG_DIR",
 ];
+
+/// The task's hidden launcher owns the only surviving job handle. Windows
+/// terminates this daemon and its children when that launcher ends, including
+/// Task Scheduler stops which do not otherwise guarantee child cleanup.
+pub(super) fn bind_service_lifetime_to_parent() -> io::Result<()> {
+    use std::mem::{size_of, zeroed};
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use std::ptr::{null, null_mut};
+    use winapi::shared::minwindef::{FALSE, FILETIME};
+    use winapi::um::handleapi::{DuplicateHandle, INVALID_HANDLE_VALUE};
+    use winapi::um::jobapi2::{
+        AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject,
+    };
+    use winapi::um::processthreadsapi::{
+        GetCurrentProcess, GetCurrentProcessId, GetProcessTimes, OpenProcess,
+    };
+    use winapi::um::tlhelp32::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+    use winapi::um::winnt::{
+        DUPLICATE_CLOSE_SOURCE, DUPLICATE_SAME_ACCESS, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+        PROCESS_DUP_HANDLE, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    // Each non-pseudo handle stays owned until Windows has accepted the transfer.
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    let snapshot = unsafe { OwnedHandle::from_raw_handle(snapshot.cast()) };
+    let mut entry: PROCESSENTRY32W = unsafe { zeroed() };
+    entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
+    let current = unsafe { GetCurrentProcess() };
+    let current_id = unsafe { GetCurrentProcessId() };
+    let mut found =
+        unsafe { Process32FirstW(snapshot.as_raw_handle().cast(), &mut entry) } != FALSE;
+    while found && entry.th32ProcessID != current_id {
+        found = unsafe { Process32NextW(snapshot.as_raw_handle().cast(), &mut entry) } != FALSE;
+    }
+    if !found || entry.th32ParentProcessID == 0 {
+        return Err(io::Error::other(
+            "The managed service launcher is unavailable.",
+        ));
+    }
+    let parent = unsafe {
+        OpenProcess(
+            PROCESS_DUP_HANDLE | PROCESS_QUERY_LIMITED_INFORMATION,
+            FALSE,
+            entry.th32ParentProcessID,
+        )
+    };
+    if parent.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let parent = unsafe { OwnedHandle::from_raw_handle(parent.cast()) };
+    let creation_time = |process| -> io::Result<u64> {
+        let mut created: FILETIME = unsafe { zeroed() };
+        let mut exited: FILETIME = unsafe { zeroed() };
+        let mut kernel: FILETIME = unsafe { zeroed() };
+        let mut user: FILETIME = unsafe { zeroed() };
+        if unsafe { GetProcessTimes(process, &mut created, &mut exited, &mut kernel, &mut user) }
+            == FALSE
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok((u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
+    };
+    // A reused parent PID cannot acquire ownership of this daemon.
+    if creation_time(parent.as_raw_handle().cast())? > creation_time(current)? {
+        return Err(io::Error::other(
+            "The managed service launcher identity changed.",
+        ));
+    }
+    let job = unsafe { CreateJobObjectW(null_mut(), null()) };
+    if job.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let job = unsafe { OwnedHandle::from_raw_handle(job.cast()) };
+    let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { zeroed() };
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if unsafe {
+        SetInformationJobObject(
+            job.as_raw_handle().cast(),
+            JobObjectExtendedLimitInformation,
+            (&mut limits as *mut JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+            size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )
+    } == FALSE
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let mut parent_job = null_mut();
+    if unsafe {
+        DuplicateHandle(
+            current,
+            job.as_raw_handle().cast(),
+            parent.as_raw_handle().cast(),
+            &mut parent_job,
+            0,
+            FALSE,
+            DUPLICATE_SAME_ACCESS,
+        )
+    } == FALSE
+    {
+        return Err(io::Error::last_os_error());
+    }
+    if unsafe { AssignProcessToJobObject(job.as_raw_handle().cast(), current) } == FALSE {
+        let error = io::Error::last_os_error();
+        // No child has entered this job. Undo only the handle transferred above.
+        let mut returned = null_mut();
+        if unsafe {
+            DuplicateHandle(
+                parent.as_raw_handle().cast(),
+                parent_job,
+                current,
+                &mut returned,
+                0,
+                FALSE,
+                DUPLICATE_SAME_ACCESS | DUPLICATE_CLOSE_SOURCE,
+            )
+        } != FALSE
+        {
+            drop(unsafe { OwnedHandle::from_raw_handle(returned.cast()) });
+        }
+        return Err(error);
+    }
+    // Closing this copy leaves the launcher's handle as the sole job owner.
+    drop(job);
+    Ok(())
+}
 
 pub(super) fn relaunch() -> io::Result<ExitStatus> {
     let nonce = Uuid::now_v7().simple().to_string();
@@ -42,6 +175,7 @@ pub(super) fn relaunch() -> io::Result<ExitStatus> {
         write_windows_powershell_script(&child_path, &child_script)?;
         write_windows_powershell_script(&parent_path, &parent_script)?;
         Command::new(windows_powershell_path()?)
+            .creation_flags(winapi::um::winbase::CREATE_NO_WINDOW)
             .args([
                 "-NoProfile",
                 "-NonInteractive",
@@ -93,6 +227,7 @@ pub(super) fn launch_detached_local_daemon(
         // the interactive-session handoff fails, its message is the only
         // evidence, so it travels with the error instead of being discarded.
         let output = Command::new(windows_powershell_path()?)
+            .creation_flags(winapi::um::winbase::CREATE_NO_WINDOW)
             .args([
                 "-NoProfile",
                 "-NonInteractive",
@@ -291,7 +426,7 @@ $encodedChild = '__ENCODED_CHILD__'
 $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
 Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
 $powerShellPath = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-$arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand $encodedChild"
+$arguments = "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -EncodedCommand $encodedChild"
 $action = New-ScheduledTaskAction -Execute $powerShellPath -Argument $arguments
 $principal = New-ScheduledTaskPrincipal -UserId $identity.Name -LogonType Interactive -RunLevel Limited
 $settings = New-ScheduledTaskSettingsSet -Priority 4 -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
@@ -326,6 +461,7 @@ __ENVIRONMENT__
     $start.WorkingDirectory = & $decode '__WORKING_DIRECTORY__'
     $start.Arguments = & $decode '__ARGUMENTS__'
     $start.UseShellExecute = $false
+    $start.CreateNoWindow = $true
     $start.RedirectStandardInput = $false
     $start.RedirectStandardOutput = $false
     $start.RedirectStandardError = $false
@@ -380,7 +516,7 @@ $stderr = New-Object System.IO.Pipes.NamedPipeServerStream(
 $exitCode = 1
 try {
     Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
-    $arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$childPath`" -TaskName $taskName -ControlPipe $controlName -StdoutPipe $stdoutName -StderrPipe $stderrName"
+    $arguments = "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$childPath`" -TaskName $taskName -ControlPipe $controlName -StdoutPipe $stdoutName -StderrPipe $stderrName"
     $powerShellPath = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
     $action = New-ScheduledTaskAction -Execute $powerShellPath -Argument $arguments
     $principal = New-ScheduledTaskPrincipal -UserId $identity.Name -LogonType Interactive -RunLevel Limited
@@ -469,6 +605,7 @@ try {
     $start.WorkingDirectory = & $decode '__WORKING_DIRECTORY__'
     $start.Arguments = & $decode '__ARGUMENTS__'
     $start.UseShellExecute = $false
+    $start.CreateNoWindow = $true
     $start.RedirectStandardInput = $true
     $start.RedirectStandardOutput = $true
     $start.RedirectStandardError = $true
@@ -541,6 +678,90 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "real child process invoked by service_job_ends_with_hidden_launcher"]
+    fn service_job_child() {
+        let ready = env::var_os("SATELLE_SERVICE_JOB_TEST_READY").expect("owned job-test path");
+        bind_service_lifetime_to_parent().expect("bind daemon lifetime to real parent");
+        assert!(unsafe { windows_sys::Win32::System::Console::GetConsoleWindow() }.is_null());
+        fs::write(ready, std::process::id().to_string()).expect("publish test child identity");
+        std::thread::sleep(std::time::Duration::from_secs(60));
+        panic!("The child survived its managed launcher.");
+    }
+
+    #[test]
+    fn service_job_ends_with_hidden_launcher() {
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+        use winapi::um::processthreadsapi::OpenProcess;
+        use winapi::um::winnt::SYNCHRONIZE;
+        use windows_sys::Win32::System::Threading::WaitForSingleObject;
+        let directory = tempfile::tempdir().expect("owned service job fixture");
+        let ready = directory.path().join("ready-pid");
+        let script = directory.path().join("owner.ps1");
+        let executable = env::current_exe().expect("real test executable");
+        let arguments = OsString::from(
+            "--exact windows_interactive_bootstrap::tests::service_job_child --ignored --nocapture",
+        );
+        let quoted_executable = executable.to_string_lossy().replace('\'', "''");
+        let quoted_arguments = arguments.to_string_lossy().replace('\'', "''");
+        let script_contents = format!(
+            "$ErrorActionPreference='Stop'\n$start=New-Object System.Diagnostics.ProcessStartInfo\n$start.FileName='{}'\n$start.Arguments='{}'\n$start.UseShellExecute=$false\n$start.CreateNoWindow=$true\n$child=[System.Diagnostics.Process]::Start($start)\n$child.WaitForExit()\nexit $child.ExitCode\n",
+            quoted_executable, quoted_arguments,
+        );
+        write_windows_powershell_script(&script, &script_contents)
+            .expect("write hidden test owner");
+        let mut owner = Command::new(windows_powershell_path().expect("system PowerShell"))
+            .creation_flags(winapi::um::winbase::CREATE_NO_WINDOW)
+            .args(["-NoProfile", "-NonInteractive", "-File"])
+            .arg(&script)
+            .env("SATELLE_SERVICE_JOB_TEST_READY", &ready)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("launch real hidden parent");
+        let result = (|| -> io::Result<()> {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while !ready.is_file() {
+                if owner.try_wait()?.is_some() || std::time::Instant::now() >= deadline {
+                    return Err(io::Error::other(
+                        "The real service job child did not become ready.",
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            let pid: u32 = fs::read_to_string(&ready)?
+                .parse()
+                .map_err(io::Error::other)?;
+            let child = unsafe { OpenProcess(SYNCHRONIZE, 0, pid) };
+            if child.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+            let child = unsafe { OwnedHandle::from_raw_handle(child.cast()) };
+            owner.kill()?;
+            owner.wait()?;
+            // The handle pins this exact child. A PID reuse cannot pass the proof.
+            if unsafe { WaitForSingleObject(child.as_raw_handle().cast(), 5_000) } != 0 {
+                return Err(io::Error::other(
+                    "The daemon outlived its managed task launcher.",
+                ));
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = owner.kill();
+            let _ = owner.wait();
+        }
+        let output = owner
+            .wait_with_output()
+            .expect("collect owned launcher output");
+        assert!(
+            result.is_ok(),
+            "{result:?}\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
     fn bootstrap_boundary_is_removed_once_without_changing_other_arguments() {
         let arguments = vec![
             OsString::from(r"C:\Program Files\Satelle\satelle.exe"),
@@ -600,6 +821,8 @@ mod tests {
         assert!(parent.contains("AllowStartIfOnBatteries"));
         assert!(parent.contains("DontStopIfGoingOnBatteries"));
         assert!(parent.contains("$powerShellPath"));
+        assert!(parent.contains("-WindowStyle Hidden"));
+        assert!(child.contains("$start.CreateNoWindow = $true"));
         assert!(!parent.contains("--bootstrap-token"));
         assert!(!child.contains("--interactive-bootstrap"));
         assert!(child.contains("FromBase64String($encodedToken)"));

@@ -2,7 +2,7 @@ use std::{
     os::windows::{io::AsRawHandle, process::CommandExt},
     process::Command,
 };
-use winapi::um::winbase::CREATE_SUSPENDED;
+use winapi::um::winbase::{CREATE_NO_WINDOW, CREATE_SUSPENDED};
 
 use crate::command_group::{GroupChild, builder::CommandGroupBuilder, winres::*};
 
@@ -28,7 +28,7 @@ impl CommandGroupBuilder<'_, Command> {
     /// ```
     pub fn spawn(&mut self) -> std::io::Result<GroupChild> {
         self.command
-            .creation_flags(self.creation_flags | CREATE_SUSPENDED);
+            .creation_flags(self.creation_flags | CREATE_SUSPENDED | CREATE_NO_WINDOW);
 
         let handles = job_object(self.kill_on_drop)?;
         let mut child = self.command.spawn()?;
@@ -44,5 +44,25 @@ impl CommandGroupBuilder<'_, Command> {
         let (job, completion_port) = handles.into_raw();
 
         Ok(GroupChild::new(child, job, completion_port))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::command_group::CommandGroup;
+
+    #[test]
+    fn background_group_has_no_console_and_preserves_output() {
+        let output = crate::command_group::builder::hidden_console_probe_command()
+            .group_spawn()
+            .expect("start hidden Windows child")
+            .wait_with_output()
+            .expect("collect hidden child output");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, b"hidden-console");
     }
 }

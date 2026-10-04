@@ -10644,6 +10644,9 @@ fn start_host_daemon_with(
         #[cfg(windows)]
         {
             let service_config = read_windows_service_config(_service_config_path)?;
+            windows_interactive_bootstrap::bind_service_lifetime_to_parent().map_err(|error| {
+                daemon_process_failure("service-owner-bind-failed", error.to_string())
+            })?;
             let path_overrides = service_config.path_overrides();
             apply_windows_service_environment(&service_config);
             command.bind = service_config.bind().to_string();
