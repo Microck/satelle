@@ -118,6 +118,12 @@ plugin, or feature flag alone is not proof of readiness.
 
 ## Recover an interrupted setup begin
 
+Windows bootstrap metadata and execution markers use explicit protected file
+permissions owned by the signed-in account, including when SSH runs elevated.
+The private directory's inherited permissions alone do not establish file
+ownership. File security is set at creation, without repeated ACL updates on
+heartbeat writes.
+
 An interrupted SSH setup can leave an execution-started bootstrap claim even
 when its maintenance ledger has no remaining recovery work. Recovery must hold the Host's
 exclusive storage ownership lock, match its pinned identity and the exact stale

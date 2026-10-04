@@ -1,4 +1,17 @@
 pub(super) const READY: &str = "satelle-bootstrap-lock-v2";
+
+// Elevated OpenSSH defaults new file ownership to Administrators. Supply the
+// owner and protected ACL at creation, rather than repairing every heartbeat.
+pub(super) const WINDOWS_PRIVATE_FILE_HELPER: &str = r#"
+$ownerOnlyFileSecurity = New-Object Security.AccessControl.FileSecurity
+$ownerOnlyFileSid = [Security.Principal.WindowsIdentity]::GetCurrent().User
+$ownerOnlyFileSecurity.SetOwner($ownerOnlyFileSid)
+$ownerOnlyFileSecurity.SetAccessRuleProtection($true, $false)
+$ownerOnlyFileSecurity.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($ownerOnlyFileSid, 'FullControl', 'Allow')))
+function Open-OwnerOnlyFile([string]$Path, [IO.FileMode]$Mode) {
+  New-Object IO.FileStream($Path, $Mode, [Security.AccessControl.FileSystemRights]::Write, [IO.FileShare]::None, 4096, [IO.FileOptions]::None, $ownerOnlyFileSecurity)
+}
+"#;
 pub(super) const BUSY: &str = "satelle-bootstrap-busy-v1";
 pub(super) const BUSY_EXIT_CODE: i32 = 75;
 pub(super) const HEARTBEAT: &str = "satelle-bootstrap-heartbeat-v1";
@@ -161,6 +174,7 @@ $claimUncertainReason = 'phase advance found uncertain execution evidence'
 $released = $false
 $mailboxPath = $null
 $nextCommand = 1
+{private_file_helper}
 function Set-OwnerOnlyDirectory([string]$Path) {{
   $acl = Get-Acl -LiteralPath $Path
   $acl.SetAccessRuleProtection($true, $false)
@@ -178,10 +192,11 @@ function Set-OwnerOnlyDirectory([string]$Path) {{
 }}
 function Write-Value([string]$Root, [string]$Name, [string]$Value) {{
   $path = Join-Path $Root $Name
-  # Every ledger root is a fresh owner-only directory whose inheritable ACL
-  # protects child files. Reapplying ACLs per heartbeat is both redundant and
-  # slow enough on Windows to violate the lock acquisition deadline.
-  [System.IO.File]::WriteAllText($path, $Value + [Environment]::NewLine)
+  $stream = Open-OwnerOnlyFile $path ([IO.FileMode]::Create)
+  try {{
+    $bytes = [Text.Encoding]::UTF8.GetBytes($Value + [Environment]::NewLine)
+    $stream.Write($bytes, 0, $bytes.Length)
+  }} finally {{ $stream.Dispose() }}
 }}
 function Write-Protocol([string]$Line) {{
   [Console]::Out.WriteLine($Line)
@@ -652,12 +667,12 @@ while ($true) {{
     }} elseif ($line.StartsWith('{MUTATION_EXECUTING} ')) {{
       $parts = @($line.Substring({executing_prefix_length}).Split(' ', [StringSplitOptions]::RemoveEmptyEntries))
       if ($parts.Count -ne 2 -or $parts[0] -cne $mutationPhase -or $parts[1] -cne $mutationAttempt) {{ exit 75 }}
-      [IO.File]::Open((Join-Path $claimPath ('execution_started.' + $mutationAttempt)), [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None).Dispose()
+      (Open-OwnerOnlyFile (Join-Path $claimPath ('execution_started.' + $mutationAttempt)) ([IO.FileMode]::CreateNew)).Dispose()
     }} elseif ($line.StartsWith('{MUTATION_COMMITTED} ')) {{
       $parts = @($line.Substring({commit_prefix_length}).Split(' ', [StringSplitOptions]::RemoveEmptyEntries))
       if ($parts.Count -ne 2 -or $parts[0] -cne $mutationPhase -or $parts[1] -cne $mutationAttempt -or
           -not (Test-Path -LiteralPath (Join-Path $claimPath ('execution_started.' + $mutationAttempt)) -PathType Leaf)) {{ exit 75 }}
-      [IO.File]::Open((Join-Path $claimPath ('execution_committed.' + $mutationAttempt)), [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None).Dispose()
+      (Open-OwnerOnlyFile (Join-Path $claimPath ('execution_committed.' + $mutationAttempt)) ([IO.FileMode]::CreateNew)).Dispose()
     }} elseif ($line -ceq '{RELEASE}') {{
       if (-not (Same-Owner)) {{ exit 75 }}
       Write-MailboxResponse $responsePath $line
@@ -695,6 +710,7 @@ while ($true) {{
   }}
 }}"#,
             mutation_prefix_length = MUTATION_STARTED.len() + 1,
+            private_file_helper = WINDOWS_PRIVATE_FILE_HELPER,
             result_prefix_length = MUTATION_RESULT_REQUEST.len() + 1,
             abandon_prefix_length = MUTATION_ABANDON_REQUEST.len() + 1,
             executing_prefix_length = MUTATION_EXECUTING.len() + 1,
@@ -1572,6 +1588,44 @@ mod tests {
             .find("Write-MailboxResponse $responsePath $line")
             .expect("abandon acknowledges the controller");
         assert!(reason < uncertain && uncertain < response);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_private_files_keep_explicit_owner_security_across_rewrites() {
+        let root = tempfile::tempdir().expect("temporary file security fixture");
+        let path = powershell_quote(&root.path().join("metadata").to_string_lossy());
+        let script = format!(
+            r#"$ErrorActionPreference = 'Stop'
+{WINDOWS_PRIVATE_FILE_HELPER}
+$path = {path}
+foreach ($mode in @([IO.FileMode]::CreateNew, [IO.FileMode]::Create)) {{
+  $stream = Open-OwnerOnlyFile $path $mode
+  try {{
+    $bytes = [Text.Encoding]::UTF8.GetBytes('heartbeat')
+    $stream.Write($bytes, 0, $bytes.Length)
+  }} finally {{ $stream.Dispose() }}
+  $acl = [IO.File]::GetAccessControl($path)
+  if (($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -cne $ownerOnlyFileSid.Value) -or
+      (-not $acl.AreAccessRulesProtected) -or ($acl.Access.Count -ne 1) -or
+      ($acl.Access[0].IsInherited)) {{ throw 'file is not explicitly owner-only' }}
+}}
+"#
+        );
+        let output = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command"])
+            .arg(script)
+            .output()
+            .expect("run real Windows file security creation");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read(root.path().join("metadata")).expect("read rewritten metadata"),
+            b"heartbeat"
+        );
     }
 
     #[test]

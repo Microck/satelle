@@ -2050,6 +2050,7 @@ $attempt = {attempt}
 $commitRequired = {commit_required}
 $fileBackedResult = {file_backed_result}
 $innerCommand = {command}
+{private_file_helper}
 $stateRoot = if ($env:SATELLE_STATE_DIR) {{ $env:SATELLE_STATE_DIR }} else {{ Join-Path $env:LOCALAPPDATA 'Satelle\state' }}
 $lockRoot = Join-Path $stateRoot 'bootstrap.lock'
 $claimPath = Join-Path $lockRoot $claimBasename
@@ -2085,7 +2086,7 @@ if ($payloadItem.PSIsContainer -or
     ((-not $fileBackedResult) -and ((Test-Path -LiteralPath $pendingReadyPath) -or
       (Test-Path -LiteralPath $readyPath)))) {{ exit 75 }}
 try {{
-  [IO.File]::Open((Join-Path $claimPath ('execution_started.' + $attempt)), [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None).Dispose()
+  (Open-OwnerOnlyFile (Join-Path $claimPath ('execution_started.' + $attempt)) ([IO.FileMode]::CreateNew)).Dispose()
   $status = 0
   $commandPrefix = 'powershell.exe -NoProfile -NonInteractive -EncodedCommand '
   if (-not $innerCommand.StartsWith($commandPrefix, [StringComparison]::Ordinal)) {{ exit 75 }}
@@ -2215,10 +2216,10 @@ if ($terminalClaimExact) {{
       $stateOwnerReleased -or
       (($status -eq {digest_mismatch_exit_code}) -and
        (($phase -ceq 'cache_upload') -or ($phase -ceq 'cache_staging_permissions')))) {{
-    [IO.File]::Open((Join-Path $claimPath ('execution_succeeded.' + $attempt)), [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None).Dispose()
+    (Open-OwnerOnlyFile (Join-Path $claimPath ('execution_succeeded.' + $attempt)) ([IO.FileMode]::CreateNew)).Dispose()
   }} elseif (($phase -ceq 'daemon_start') -or
             ($phase -ceq 'offline_storage_maintenance')) {{
-    [IO.File]::Open((Join-Path $claimPath ('execution_failed.' + $attempt)), [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None).Dispose()
+    (Open-OwnerOnlyFile (Join-Path $claimPath ('execution_failed.' + $attempt)) ([IO.FileMode]::CreateNew)).Dispose()
   }}
   if ($fileBackedResult) {{
     $effectiveStatus = if ($stateOwnerReleased -or ($status -eq 0)) {{ 0 }} elseif ($status -eq {digest_mismatch_exit_code}) {{ {digest_mismatch_exit_code} }} else {{ 1 }}
@@ -2234,6 +2235,7 @@ if ($stateOwnerReleased -or ($status -eq 0)) {{ exit 0 }}
 if ($status -eq {digest_mismatch_exit_code}) {{ exit {digest_mismatch_exit_code} }}
 exit 1"#,
                 digest_mismatch_exit_code = STAGED_DIGEST_MISMATCH_EXIT_CODE,
+                private_file_helper = bootstrap_lock::WINDOWS_PRIVATE_FILE_HELPER,
                 commit_required = if commit_required { "$true" } else { "$false" },
                 file_backed_result = if windows_file_backed_result {
                     "$true"
