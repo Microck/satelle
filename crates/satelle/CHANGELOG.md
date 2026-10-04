@@ -1,3 +1,13 @@
+## satelle@0.1.30
+
+### Background Windows hosts
+
+Keep background bootstrap helpers, Host Daemons and provider processes out of visible terminal windows. Keep app-access and operating-system approval prompts visible.
+
+End the persistent Host Daemon and its children when its scheduled task stops.
+
+Validate hidden scheduled-task actions during service discovery and maintenance. Use absolute-path checks supported by Windows PowerShell.
+
 ## satelle@0.1.29
 
 ### Host recovery
