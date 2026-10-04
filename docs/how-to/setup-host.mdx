@@ -115,3 +115,21 @@ satelle host status --host local-demo --json
 
 `ready` means the live action-path probe succeeded on this Host. A binary,
 plugin, or feature flag alone is not proof of readiness.
+
+## Recover an interrupted setup begin
+
+An interrupted SSH setup can leave an execution-started bootstrap claim even
+when its maintenance ledger has no remaining recovery work. Recovery must hold the Host's
+exclusive storage ownership lock, match its pinned identity and the exact stale
+claim, and confirm that the operation has no setup ledger entry. A missing entry
+in a public history summary is insufficient.
+
+The owner-local recovery operation archives the complete claim with a durable
+ledger-absence receipt. A missing run can also mean retention removed a known
+terminal outcome; recovery does not claim that the operation never ran.
+Running and outcome-unknown ledger entries cannot expire and prevent archival.
+Recovery never deletes the claim evidence, resets the Host store,
+changes credentials, or treats another mutation phase as an uncommitted begin.
+A live owner, recent heartbeat, existing ledger run, unexpected execution marker,
+or changed claim stops recovery before archival. Re-run normal setup only after
+this exact recovery succeeds.

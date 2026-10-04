@@ -103,6 +103,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock, RwLockReadGuard, Weak};
 use std::time::{Duration, Instant};
 use storage::Storage;
+pub use storage::bootstrap_recovery::BootstrapBeginRecovery;
 pub use storage::{
     OperatorLogFailureKind, OperatorLogSinkHealth, PlatformLogFailureKind, PlatformLogSinkHealth,
     SetupActionCounts, SetupActionPlan, SetupActionRecord, SetupActionSkipReason,
@@ -2173,6 +2174,24 @@ pub(crate) const STORAGE_MIGRATION_ACTION_LABEL: &str =
     "Migrate Host storage to the verified destination";
 
 impl HostService {
+    /// Owner-local recovery for a setup begin with no remaining ledger run.
+    /// Storage ownership remains exclusive until the exact claim is archived.
+    pub fn recover_bootstrap_begin_without_run(
+        state_root: &Path,
+        bootstrap_state_root: &Path,
+        expected_host_identity: &str,
+        operation_id: &str,
+        apply: bool,
+    ) -> Result<BootstrapBeginRecovery, SatelleError> {
+        storage::bootstrap_recovery::recover(
+            state_root,
+            bootstrap_state_root,
+            expected_host_identity,
+            operation_id,
+            apply,
+        )
+        .map_err(runtime::storage_failure)
+    }
     pub fn app_approval_requests(&self) -> Result<Vec<AppApprovalRequest>, SatelleError> {
         self.runtime.app_approval_requests()
     }

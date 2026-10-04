@@ -706,6 +706,9 @@ struct PathsCommand {
 #[derive(Subcommand, Debug)]
 enum HostCommand {
     Start(Box<HostStartCommand>),
+    /// Internal owner-local reconciliation of a setup begin with no ledger run.
+    #[command(hide = true)]
+    RecoverBootstrapBegin(RecoverBootstrapBeginCommand),
     /// Internal owner-local request for a running SSH daemon to release its store.
     #[command(hide = true)]
     ReleaseState,
@@ -740,6 +743,25 @@ enum HostCommand {
         #[command(subcommand)]
         command: storage_migration::OfflineCommand,
     },
+}
+
+#[derive(Args, Debug)]
+#[group(required = true, multiple = false, args = ["dry_run", "yes"])]
+struct RecoverBootstrapBeginCommand {
+    #[arg(long)]
+    state_root: PathBuf,
+    #[arg(long)]
+    bootstrap_state_root: PathBuf,
+    #[arg(long)]
+    expected_host_id: String,
+    #[arg(long)]
+    operation_id: String,
+    #[arg(long)]
+    dry_run: bool,
+    #[arg(long)]
+    yes: bool,
+    #[command(flatten)]
+    output_args: OutputArgs,
 }
 
 #[derive(Args, Debug)]
@@ -3219,6 +3241,9 @@ fn history_target(command: &Command) -> Option<HistoryTarget<'_>> {
             command: HostCommand::ReleaseState,
         } => return None,
         Command::Host {
+            command: HostCommand::RecoverBootstrapBegin(_),
+        } => return None,
+        Command::Host {
             command: HostCommand::Start(command),
         } if command.local_daemon_config.is_some() => return None,
         Command::Host {
@@ -3248,6 +3273,7 @@ fn history_target(command: &Command) -> Option<HistoryTarget<'_>> {
             explicit_host: match command {
                 HostCommand::Start(_) => None,
                 HostCommand::ReleaseState => None,
+                HostCommand::RecoverBootstrapBegin(_) => None,
                 HostCommand::Trust(command) => Some(command.host.as_str()),
                 HostCommand::Status(command) => command.host.as_deref(),
                 HostCommand::Stop(command) | HostCommand::Restart(command) => {
@@ -9887,6 +9913,17 @@ fn run_host(
     match command {
         HostCommand::Start(command) => start_host_daemon(*command, config, format),
         HostCommand::ReleaseState => release_ssh_state_owner(),
+        HostCommand::RecoverBootstrapBegin(command) => {
+            let report = satelle::host::HostService::recover_bootstrap_begin_without_run(
+                &command.state_root,
+                &command.bootstrap_state_root,
+                &command.expected_host_id,
+                &command.operation_id,
+                command.yes,
+            )
+            .map_err(failure)?;
+            format.print(&report).map_err(failure)
+        }
         HostCommand::OfflineStorageMigration { command } => storage_migration::run_offline(command),
         HostCommand::Trust(command) => trust_host(command, config, format),
         HostCommand::Status(command) => {
