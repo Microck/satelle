@@ -2302,11 +2302,13 @@ fn events_json_scopes_direct_daemon_unreachable_to_run_when_wss_cannot_connect()
     test_file::write_user_controlled(&token_file, token.expose().as_str())
         .expect("write owner-only API token");
 
-    let closed_listener = TcpListener::bind("127.0.0.1:0").expect("bind temporary port");
-    let closed_address = closed_listener
-        .local_addr()
-        .expect("read temporary address");
-    drop(closed_listener);
+    // Reserve the endpoint without listening. Releasing an ephemeral port
+    // lets parallel tests reuse it before both CLI subprocesses have finished.
+    let closed_socket = tokio::net::TcpSocket::new_v4().expect("create reserved endpoint");
+    closed_socket
+        .bind("127.0.0.1:0".parse().unwrap())
+        .expect("reserve absent endpoint");
+    let closed_address = closed_socket.local_addr().expect("read reserved endpoint");
     let token_path = toml::Value::String(token_file.to_string_lossy().into_owned()).to_string();
     write_user_config(
         &user_config,
