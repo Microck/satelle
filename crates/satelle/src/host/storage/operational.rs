@@ -13,6 +13,48 @@ use crate::host::{
 };
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
+type ProbeRecoveryRow = (
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    String,
+);
+
+fn probe_recovery_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProbeRecoveryRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+    ))
+}
+
+fn probe_recovery_subject(
+    (host, desktop, probe, thread, turn, lease_state): ProbeRecoveryRow,
+    kind: ReadinessProbeKind,
+) -> Result<ProbeRecoverySubject, StorageError> {
+    let recovery_pending = match lease_state.as_str() {
+        "active" => false,
+        "recovery_pending" => true,
+        _ => return Err(StorageError::new(StorageErrorKind::InvalidStoredState)),
+    };
+    Ok(ProbeRecoverySubject {
+        host_identity: crate::core::session::HostIdentityRef::new(host)
+            .map_err(|_| StorageError::new(StorageErrorKind::InvalidStoredState))?,
+        desktop_binding: DesktopBindingRef::new(desktop)
+            .map_err(|_| StorageError::new(StorageErrorKind::InvalidStoredState))?,
+        probe_kind: kind,
+        probe_ref: PrivateUpstreamRef::new(probe)?,
+        upstream_thread_ref: thread.map(PrivateUpstreamRef::new).transpose()?,
+        upstream_turn_ref: turn.map(PrivateUpstreamRef::new).transpose()?,
+        recovery_pending,
+    })
+}
+
 impl Storage {
     pub(crate) fn maintenance_lease_state(
         &self,
@@ -675,6 +717,32 @@ impl Storage {
         self.pending_readiness_probe(host_identity, desktop_binding, ReadinessProbeKind::Native)
     }
 
+    pub(crate) fn pending_native_probe_recoveries(
+        &self,
+        host_identity: &crate::core::session::HostIdentityRef,
+    ) -> Result<Vec<ProbeRecoverySubject>, StorageError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT host_identity_ref, desktop_binding_ref, native_probe_ref,
+                    upstream_thread_ref, upstream_turn_ref, lease_state
+             FROM control_leases
+             WHERE host_identity_ref = ?1
+               AND owner_kind = 'native_probe'
+               AND lease_state = 'recovery_pending'
+             ORDER BY desktop_binding_ref",
+            )
+            .map_err(operation_failed)?;
+        statement
+            .query_map([host_identity.as_str()], probe_recovery_row)
+            .map_err(operation_failed)?
+            .map(|row| {
+                row.map_err(operation_failed)
+                    .and_then(|row| probe_recovery_subject(row, ReadinessProbeKind::Native))
+            })
+            .collect()
+    }
+
     pub(crate) fn pending_provider_probe(
         &self,
         host_identity: &crate::core::session::HostIdentityRef,
@@ -707,37 +775,11 @@ impl Storage {
                     desktop_binding.as_str(),
                     kind.owner_kind()
                 ],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, Option<String>>(3)?,
-                        row.get::<_, Option<String>>(4)?,
-                        row.get::<_, String>(5)?,
-                    ))
-                },
+                probe_recovery_row,
             )
             .optional()
             .map_err(operation_failed)?
-            .map(|(host, desktop, probe, thread, turn, lease_state)| {
-                let recovery_pending = match lease_state.as_str() {
-                    "active" => false,
-                    "recovery_pending" => true,
-                    _ => return Err(StorageError::new(StorageErrorKind::InvalidStoredState)),
-                };
-                Ok(ProbeRecoverySubject {
-                    host_identity: crate::core::session::HostIdentityRef::new(host)
-                        .map_err(|_| StorageError::new(StorageErrorKind::InvalidStoredState))?,
-                    desktop_binding: DesktopBindingRef::new(desktop)
-                        .map_err(|_| StorageError::new(StorageErrorKind::InvalidStoredState))?,
-                    probe_kind: kind,
-                    probe_ref: PrivateUpstreamRef::new(probe)?,
-                    upstream_thread_ref: thread.map(PrivateUpstreamRef::new).transpose()?,
-                    upstream_turn_ref: turn.map(PrivateUpstreamRef::new).transpose()?,
-                    recovery_pending,
-                })
-            })
+            .map(|row| probe_recovery_subject(row, kind))
             .transpose()
     }
 

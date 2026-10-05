@@ -1728,6 +1728,163 @@ fn native_probe_ordinary_failure_preserves_only_possible_dispatch() {
 }
 
 #[test]
+fn maintenance_reconciles_terminal_native_probes_without_dispatching_again() {
+    for terminal in [
+        RecoveryObservation::Completed,
+        RecoveryObservation::Blocked,
+        RecoveryObservation::Failed,
+    ] {
+        let state = crate::host::TestStateDir::new().unwrap();
+        let adapter = ProviderProbeRecoveryAdapter::with_native_only_results(
+            [
+                RecoveryObservation::Running,
+                RecoveryObservation::Unknown,
+                terminal,
+            ],
+            [NativeProbeBehavior::FailedAfterDispatch],
+        );
+        let runtime = RuntimeHandle::new_with_readiness_probe_driver(
+            Ok(state.path().to_path_buf()),
+            adapter.clone(),
+            adapter.clone(),
+        );
+        runtime
+            .run(RunCommand::attached(
+                LOCAL_DEMO_HOST,
+                "retain uncertain native probe",
+            ))
+            .expect_err("uncertain dispatch must retain recovery ownership");
+        let plan = crate::host::storage::SetupRunPlan::new(
+            "maintenance-after-probe",
+            crate::host::storage::SetupOperationKind::Repair,
+            None,
+            time::OffsetDateTime::now_utc(),
+            vec![
+                crate::host::storage::SetupActionPlan::new(
+                    "bootstrap-handoff",
+                    "Bootstrap handoff",
+                    true,
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        for _ in 0..2 {
+            let error = match runtime.begin_bootstrap_maintenance(&plan) {
+                Err(error) => error,
+                Ok(_) => panic!("running and unknown probes must block maintenance"),
+            };
+            assert_eq!(error.code, crate::core::ErrorCode::HostBusy);
+            let engine = runtime.engine().unwrap();
+            let storage = engine.lock_storage().unwrap();
+            let counts: (i64, i64) = storage.connection_for_test().query_row(
+                "SELECT (SELECT count(*) FROM control_leases WHERE owner_kind = 'native_probe'), (SELECT count(*) FROM setup_runs)",
+                [], |row| Ok((row.get(0)?, row.get(1)?)),
+            ).unwrap();
+            assert_eq!(counts, (1, 0));
+        }
+        let maintenance = runtime
+            .begin_bootstrap_maintenance(&plan)
+            .expect("confirmed terminal probe permits maintenance");
+        let engine = runtime.engine().unwrap();
+        let storage = engine.lock_storage().unwrap();
+        let leases: i64 = storage
+            .connection_for_test()
+            .query_row(
+                "SELECT count(*) FROM control_leases WHERE owner_kind = 'native_probe'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let status: String = storage
+            .connection_for_test()
+            .query_row("SELECT status FROM native_readiness_results", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(leases, 0);
+        assert_eq!(status, "outcome_unknown");
+        assert_eq!(adapter.observation_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(adapter.native_probe_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(adapter.provider_probe_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(adapter.execute_calls.load(Ordering::SeqCst), 0);
+        drop(storage);
+        drop(maintenance);
+    }
+}
+
+#[test]
+fn maintenance_does_not_observe_or_release_active_native_probes() {
+    let state = crate::host::TestStateDir::new().unwrap();
+    let adapter =
+        ProviderProbeRecoveryAdapter::with_native_only_results([RecoveryObservation::Failed], []);
+    let runtime = RuntimeHandle::new_with_readiness_probe_driver(
+        Ok(state.path().to_path_buf()),
+        adapter.clone(),
+        adapter.clone(),
+    );
+    let engine = runtime.engine().unwrap();
+    let now = time::OffsetDateTime::now_utc();
+    let owner = LeaseOwner::new(
+        "active-native-probe",
+        engine.process_identity.process_id(),
+        engine.process_identity.process_start_ref(),
+        engine.process_identity.boot_identity_ref(),
+        now,
+    )
+    .unwrap();
+    engine
+        .lock_storage()
+        .unwrap()
+        .begin_native_probe(
+            &ProviderProbeRecoveryAdapter::native_only_key(),
+            "active-native-probe",
+            &owner,
+        )
+        .unwrap();
+    let plan = crate::host::storage::SetupRunPlan::new(
+        "maintenance-during-probe",
+        crate::host::storage::SetupOperationKind::Repair,
+        None,
+        now,
+        vec![
+            crate::host::storage::SetupActionPlan::new(
+                "bootstrap-handoff",
+                "Bootstrap handoff",
+                true,
+            )
+            .unwrap(),
+        ],
+    )
+    .unwrap();
+    let error = match runtime.begin_bootstrap_maintenance(&plan) {
+        Err(error) => error,
+        Ok(_) => panic!("active native probe must block maintenance"),
+    };
+    assert_eq!(error.code, crate::core::ErrorCode::HostBusy);
+    assert_eq!(
+        error
+            .details
+            .get("active_operation_id")
+            .and_then(serde_json::Value::as_str),
+        Some("active-native-probe")
+    );
+    let lease_state: String = engine
+        .lock_storage()
+        .unwrap()
+        .connection_for_test()
+        .query_row(
+            "SELECT lease_state FROM control_leases WHERE operation_id = 'active-native-probe'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(lease_state, "active");
+    assert_eq!(adapter.observation_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(adapter.native_probe_calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
 fn manual_action_native_failure_is_retained_but_never_reused() {
     let state = crate::host::TestStateDir::new().expect("temporary state directory should exist");
     let adapter = ProviderProbeRecoveryAdapter::with_native_only_results(
