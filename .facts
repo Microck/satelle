@@ -209,6 +209,7 @@
 - satelle installation documentation lists npm, pnpm, and bun npm-registry installs before non-npm methods because npm-registry distribution is the recommended local CLI install path @spec @mvp @implemented
 - satelle MVP first-party non-npm local install methods are a Unix shell installer, a Windows PowerShell installer, a Homebrew tap, a Scoop bucket, and direct GitHub release archive downloads @spec @mvp @implemented
 - satelle Unix shell installer supports curl and wget entrypoints that pipe a canonical HTTPS installer script into sh @spec @mvp @implemented
+- the Unix installer records each background command and polling child before honoring termination, reaps owned children before releasing its exact install lock, and never leaves a download running after interruption @spec @mvp @implemented
 - label: the Unix shell installer requires gh and jq in addition to curl or wget, fails before downloading when either verified prerequisite is unavailable, and uses jq to validate every required satelle.paths.v2 source member against the closed PathSource vocabulary
   id: 9ih
   command: node --test npm/test/release-followup.test.cjs

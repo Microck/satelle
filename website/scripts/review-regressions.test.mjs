@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -173,9 +173,10 @@ for (const mascot of [' ▐▛███▜▌\n▝▜█████▛▘\n  �
 }
 
 const installer = read('../public/install');
-const helperStart = installer.indexOf('run_with_timeout() {');
-const helperEnd = installer.indexOf('\n}\n', helperStart);
-assert.ok(helperStart >= 0 && helperEnd > helperStart);
+const helperStart = installer.indexOf('launch_owned_child() {');
+const timeoutStart = installer.indexOf('run_with_timeout() {', helperStart);
+const helperEnd = installer.indexOf('\n}\n', timeoutStart);
+assert.ok(helperStart >= 0 && timeoutStart > helperStart && helperEnd > timeoutStart);
 const helper = installer.slice(helperStart, helperEnd + 3);
 const preflightStart = installer.indexOf('command -v gh');
 const preflightEnd = installer.indexOf('validate_paths_output()', preflightStart);
@@ -212,6 +213,7 @@ test('installer preflight fails a stalled gh instead of hanging', () => {
   try {
     writeFileSync(join(directory, 'jq'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
     writeFileSync(join(directory, 'gh'), '#!/bin/sh\ntrap "" TERM\nexec sleep 30\n', { mode: 0o755 });
+    symlinkSync('/bin/sleep', join(directory, 'sleep'));
     // Shrink only the preflight timeout so the lifecycle path stays fast.
     const stalled = preflight.replace(/run_with_timeout \d+/, 'run_with_timeout 1');
     assert.notEqual(stalled, preflight);

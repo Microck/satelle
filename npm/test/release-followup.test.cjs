@@ -472,41 +472,63 @@ test("Unix installer bounds network commands and releases its lock on TERM", {
   assert.match(installer, /run_with_timeout 300 gh api/);
   assert.match(installer, /run_with_timeout 300 gh attestation verify/);
 
-  const root = mkdtempSync(path.join(tmpdir(), "satelle-installer-signal-"));
-  context.after(() => rmSync(root, { recursive: true, force: true }));
-  const commands = path.join(root, "commands");
-  const bin = path.join(root, "bin");
-  mkdirSync(commands);
-  writeExecutable(
-    path.join(commands, "curl"),
-    "#!/bin/sh\ntrap '' TERM\nwhile :; do sleep 1; done\n",
-  );
-  writeExecutable(path.join(commands, "gh"), "#!/bin/sh\nexit 0\n");
-  writeExecutable(path.join(commands, "jq"), "#!/bin/sh\nexit 0\n");
-
-  const installerProcess = spawn(
-    "/bin/sh",
-    [installerPath, "--version", "0.1.0", "--bin-dir", bin],
-    {
-      env: { ...process.env, PATH: `${commands}:${process.env.PATH}` },
-      stdio: ["ignore", "ignore", "pipe"],
-    },
-  );
-  let installerStderr = "";
-  installerProcess.stderr.on("data", (chunk) => {
-    installerStderr += chunk;
-  });
-  context.after(() => {
-    if (installerProcess.exitCode === null) installerProcess.kill("SIGKILL");
-  });
-
-  const lockPath = path.join(bin, ".satelle-install.lock");
-  await waitForPath(lockPath);
-  installerProcess.kill("SIGTERM");
-  const [exitCode, signal] = await once(installerProcess, "exit");
-  assert.equal(signal, null);
-  assert.equal(exitCode, 143, installerStderr);
-  assert.equal(existsSync(lockPath), false);
+  for (const timing of ["blocked command", "child PID capture"]) {
+    await context.test(timing, { timeout: 5_000 }, async (probe) => {
+      const root = mkdtempSync(path.join(tmpdir(), "satelle-installer-signal-"));
+      const commands = path.join(root, "commands");
+      const bin = path.join(root, "bin");
+      const childPidPath = path.join(root, "download.pid");
+      mkdirSync(commands);
+      writeExecutable(path.join(commands, "curl"), `#!/bin/sh
+printf '%s\n' "$$" >"$SATELLE_SIGNAL_FIXTURE_PID_PATH.pending"
+mv "$SATELLE_SIGNAL_FIXTURE_PID_PATH.pending" "$SATELLE_SIGNAL_FIXTURE_PID_PATH"
+trap '' TERM
+while :; do sleep 1; done
+`);
+      writeExecutable(path.join(commands, "gh"), "#!/bin/sh\nexit 0\n");
+      writeExecutable(path.join(commands, "jq"), "#!/bin/sh\nexit 0\n");
+      let testedInstallerPath = installerPath;
+      if (timing === "child PID capture") {
+        const childLaunch = '  "$@" &\n  case "$launch_role" in';
+        assert.equal(installer.split(childLaunch).length, 2);
+        // Deliver a real TERM at the otherwise scheduler-dependent ownership gap.
+        const interruptedLaunch = `  "$@" &
+  if [ "$1" = curl ]; then
+    while [ ! -f "$SATELLE_SIGNAL_FIXTURE_PID_PATH" ]; do sleep 0.01; done
+    kill -TERM "$$"
+  fi
+  case "$launch_role" in`;
+        testedInstallerPath = path.join(root, "installer.sh");
+        writeFileSync(testedInstallerPath, installer.replace(childLaunch, () => interruptedLaunch));
+      }
+      const installerProcess = spawn("/bin/sh", [testedInstallerPath, "--version", "0.1.0", "--bin-dir", bin], {
+        env: { ...process.env, PATH: `${commands}:${process.env.PATH}`, SATELLE_SIGNAL_FIXTURE_PID_PATH: childPidPath },
+        stdio: ["ignore", "ignore", "pipe"],
+      });
+      const exited = once(installerProcess, "exit");
+      let installerStderr = "";
+      installerProcess.stderr.on("data", (chunk) => { installerStderr += chunk; });
+      probe.after(() => {
+        try {
+          if (installerProcess.exitCode === null) installerProcess.kill("SIGKILL");
+          if (existsSync(childPidPath)) {
+            const childPid = Number(readFileSync(childPidPath, "utf8").trim());
+            try { process.kill(childPid, "SIGKILL"); } catch (error) { if (error.code !== "ESRCH") throw error; }
+          }
+        } finally {
+          rmSync(root, { recursive: true, force: true });
+        }
+      });
+      await waitForPath(childPidPath);
+      if (timing === "blocked command") installerProcess.kill("SIGTERM");
+      const [exitCode, signal] = await exited;
+      assert.equal(signal, null);
+      assert.equal(exitCode, 143, installerStderr);
+      assert.equal(existsSync(path.join(bin, ".satelle-install.lock")), false);
+      const childPid = Number(readFileSync(childPidPath, "utf8").trim());
+      assert.throws(() => process.kill(childPid, 0), { code: "ESRCH" }, "the download child must be reaped");
+    });
+  }
 });
 
 test("Unix installer performs verified install, upgrade, smoke, receipt, and uninstall", {

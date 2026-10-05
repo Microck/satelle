@@ -57,6 +57,8 @@ had_binary=0
 had_receipt=0
 active_command_pid=""
 active_wait_pid=""
+child_launch_in_progress=0
+pending_signal_status=""
 
 remove_file_if_present() {
   remove_path=$1
@@ -106,6 +108,10 @@ cleanup() {
 }
 
 terminate() {
+  if [ "$child_launch_in_progress" -eq 1 ]; then
+    pending_signal_status=${pending_signal_status:-$1}
+    return
+  fi
   status=$1
   trap - EXIT HUP INT TERM
   cleanup
@@ -130,13 +136,29 @@ acquire_install_lock() {
   fi
 }
 
+# A signal can arrive between fork and assigning $!. Defer it only until the
+# new child's PID is recorded, then reap that child before releasing the lock.
+launch_owned_child() {
+  launch_role=$1
+  shift
+  child_launch_in_progress=1
+  "$@" &
+  case "$launch_role" in
+    command) active_command_pid=$! ;;
+    wait) active_wait_pid=$! ;;
+  esac
+  child_launch_in_progress=0
+  if [ -n "$pending_signal_status" ]; then
+    terminate "$pending_signal_status"
+  fi
+}
+
 # Keep both the command and polling sleep as direct children so every signal path can reap
 # them before cleanup releases the installation lock.
 run_with_timeout() {
   timeout_seconds=$1
   shift
-  "$@" &
-  active_command_pid=$!
+  launch_owned_child command "$@"
   elapsed_ticks=0
   timeout_ticks=$((timeout_seconds * 10))
 
@@ -145,8 +167,7 @@ run_with_timeout() {
       kill -TERM "$active_command_pid" 2>/dev/null || :
       grace_ticks=0
       while kill -0 "$active_command_pid" 2>/dev/null && [ "$grace_ticks" -lt 50 ]; do
-        sleep 0.1 &
-        active_wait_pid=$!
+        launch_owned_child wait sleep 0.1
         wait "$active_wait_pid" 2>/dev/null || :
         active_wait_pid=""
         grace_ticks=$((grace_ticks + 1))
@@ -157,8 +178,7 @@ run_with_timeout() {
       return 124
     fi
 
-    sleep 0.1 &
-    active_wait_pid=$!
+    launch_owned_child wait sleep 0.1
     wait "$active_wait_pid" 2>/dev/null || :
     active_wait_pid=""
     elapsed_ticks=$((elapsed_ticks + 1))
