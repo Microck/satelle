@@ -9,8 +9,10 @@ system. `SATELLE_HOME` relocates the config, state, cache, and log roots.
 `SATELLE_LOG_DIR` override individual absolute paths.
 
 Configuration selects behavior; it does not make an unimplemented transport
-operation available. Local setup is planning-only, SSH setup is limited to the
-on-demand transport token handoff, and direct setup is unavailable.
+operation available. Local setup is planning-only, and direct setup is
+unavailable. SSH setup supports on-demand mode and persistent user-scoped
+login-session services on macOS and Windows. See [Host setup](/docs/how-to/setup-host)
+for lifecycle selection and the setup plan.
 
 ## User configuration
 
