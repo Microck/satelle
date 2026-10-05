@@ -1,3 +1,9 @@
+## satelle@0.1.32
+
+### Bootstrap recovery
+
+Recover interrupted POSIX setup begins whose claim directory nonce differs from the private claim identity. Preserve ownership, stale-heartbeat, execution-marker and no-ledger-run checks, and archive the whole claim with a receipt.
+
 ## satelle@0.1.31
 
 ### Quiet background commands
