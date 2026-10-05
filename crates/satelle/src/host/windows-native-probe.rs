@@ -152,7 +152,8 @@ fn run_window(
     ready_sender: mpsc::SyncSender<std::io::Result<()>>,
 ) {
     // This worker owns only the transient readiness window. Physical pixels
-    // must match Sky screenshots; do not change the Host's process-wide DPI.
+    // define normalized targets; Sky inputs use current logical screenshot dimensions.
+    // Do not change the Host's process-wide DPI.
     if unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) }.is_null()
     {
         let _ = ready_sender.send(Err(std::io::Error::last_os_error()));
