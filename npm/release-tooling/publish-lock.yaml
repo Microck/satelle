@@ -1,6 +1,6 @@
 core:changelogs:
-  - content: "---\npackages:\n  cargo:satelle:\n    type: patch\n---\n\n## Host recovery\n\nRun Windows interactive and persistent Host tasks at normal priority so managed SDK verification can finish promptly.\n\nRun Doctor on authenticated direct and SSH Hosts. Keep diagnostics on the Host that owns readiness and require control permission.\n\nKeep local daemon and SSH tunnel traffic away from unrelated HTTP proxy settings.\n\nCreate Windows bootstrap metadata and execution markers with explicit user ownership and protected permissions.\n\nRecover an orphaned setup begin only after exclusive local store ownership proves it has no retained ledger run. Preserve the original claim and a durable recovery receipt.\n\nShow safe startup stages when managed Codex admission stalls.\n"
-    filename: native-recovery.md
+  - content: "---\npackages:\n  cargo:satelle:\n    type: patch\n---\n\n## Host startup and recovery\n\nKeep detached Windows desktop Hosts alive after the bootstrap SSH connection closes. Preserve hidden helpers and stop unconfirmed handoff tasks.\n\nOpen native Windows null handles correctly and report redirected PowerShell failures with their real exit codes.\n\nRecover interrupted inactive Windows Host starts and POSIX service restarts after checking the daemon, service, listener and old launcher twice. Preserve the original claim, execution markers and diagnostic mailbox without treating an unknown restart as successful.\n\nDetect the canonical Mac launchd service and full Host executable paths during recovery.\n\n## Unix installation\n\nReap download and polling children before releasing an interrupted install lock, including termination during child PID capture.\n"
+    filename: host-recovery.md
     v: 0.0.0
 core:packages:
   - id: npm:satelle-repository
@@ -8,7 +8,7 @@ core:packages:
   - id: npm:satelle-docs
     updated: false
   - changelogIds:
-      - native-recovery.md
+      - host-recovery.md
     id: cargo:satelle
     updated: true
 npm:packages:

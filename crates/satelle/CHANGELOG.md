@@ -1,3 +1,19 @@
+## satelle@0.1.33
+
+### Host startup and recovery
+
+Keep detached Windows desktop Hosts alive after the bootstrap SSH connection closes. Preserve hidden helpers and stop unconfirmed handoff tasks.
+
+Open native Windows null handles correctly and report redirected PowerShell failures with their real exit codes.
+
+Recover interrupted inactive Windows Host starts and POSIX service restarts after checking the daemon, service, listener and old launcher twice. Preserve the original claim, execution markers and diagnostic mailbox without treating an unknown restart as successful.
+
+Detect the canonical Mac launchd service and full Host executable paths during recovery.
+
+### Unix installation
+
+Reap download and polling children before releasing an interrupted install lock, including termination during child PID capture.
+
 ## satelle@0.1.32
 
 ### Bootstrap recovery
