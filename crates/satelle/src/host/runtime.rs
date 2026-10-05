@@ -2417,6 +2417,15 @@ impl RuntimeEngine {
         if self.provider_policy.desktop_bindings.len() != 1 {
             return Ok(false);
         }
+        // First use and setup invalidation leave no evidence to authenticate.
+        // Do not launch native runtime discovery for this status-only miss.
+        if !self
+            .lock_storage()?
+            .has_native_readiness_candidate(time::OffsetDateTime::now_utc())
+            .map_err(model::storage_failure)?
+        {
+            return Ok(false);
+        }
         let intent = ProviderComputerUseIntent::host_default();
         let key = match self.adapter.readiness_cache_key(host, &intent) {
             Ok(Some(key)) => key,

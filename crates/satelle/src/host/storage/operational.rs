@@ -1075,6 +1075,29 @@ impl Storage {
         require_idempotent_write(changed)
     }
 
+    /// A cheap negative lookup before resolving the authenticated runtime key.
+    /// A candidate never authorizes work; load_reusable_readiness still checks
+    /// every current key field before evidence can be reused.
+    pub(crate) fn has_native_readiness_candidate(
+        &self,
+        now: time::OffsetDateTime,
+    ) -> Result<bool, StorageError> {
+        let host_identity = self.host_identity()?;
+        self.connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM native_readiness_results
+                    WHERE host_identity_ref = ?1
+                      AND status = 'passed'
+                      AND observed_at <= ?2
+                      AND expires_at > ?2
+                 )",
+                params![host_identity.as_str(), unix_timestamp_nanos(now)?],
+                |row| row.get(0),
+            )
+            .map_err(operation_failed)
+    }
+
     /// Returns only a matching, unexpired success. Failed results remain in
     /// the authoritative store for diagnostics but never authorize execution.
     pub(crate) fn load_reusable_readiness(

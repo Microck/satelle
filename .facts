@@ -421,6 +421,7 @@
 - satelle run supports --quiet to suppress the preflight summary for automation @implemented @mvp
 - satelle run supports a verbose option that expands preflight output into detailed host, readiness, transport, and provider diagnostics @implemented @mvp
 - satelle run and steer automatically run the native Computer Use readiness smoke test during preflight when no valid matching native readiness cache entry exists, including first use after setup @spec @mvp @implemented
+- satelle Host capabilities reports native readiness unavailable without resolving native runtime authentication when authoritative storage contains no unexpired successful readiness candidate; a candidate still requires the full authenticated current cache key before reuse @spec @mvp @implemented
 - satelle run and steer do not require the user to run satelle doctor --scope computer-use --refresh before first prompt execution @spec @mvp @implemented
 - satelle run and steer do not start the prompt turn until native Computer Use readiness passes through a valid cache entry or a live harmless readiness smoke test @spec @mvp @implemented
 - satelle native Computer Use readiness checks distinguish pointer click support from click-and-drag support instead of treating a successful click as full pointer readiness @spec @mvp @implemented
