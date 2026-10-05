@@ -2352,6 +2352,7 @@
 - Windows file-backed mutation retains the launcher process handle and exit code while waiting only for that launcher, not a detached daemon descendant, and durable daemon starts use the signed-in desktop launcher @spec @mvp @implemented
 - Windows durable daemon launch opens the NUL device through CreateFileW, keeps its native handle alive through child creation, and restores parent handles before returning @spec @mvp @implemented
 - Windows durable bootstrap failures retain only a closed set of launch-stage names from diagnostic stderr; raw remote diagnostics and credentials are never reproduced @spec @mvp @implemented
+- an interrupted Windows daemon-start claim can recover only when stale exact evidence and two process snapshots prove that its fenced wrapper, scheduled bootstrap tasks, and daemon launchers are absent, together with the daemon, service, and listener; unknown process metadata keeps the claim fenced, and recovery preserves the original claim and mailbox in an archive without fabricating a terminal result @spec @mvp @implemented
 - satelle supports direct transport for hosts where SSH bootstrap is unavailable but a Host Daemon is already installed and reachable @spec @mvp @implemented
 
 # research
