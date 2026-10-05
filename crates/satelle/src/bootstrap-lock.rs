@@ -823,8 +823,16 @@ restore_competitor() {{
 }}
 record_recovery() {{
   record="$state_root/bootstrap-recovery-$1.json"
-  printf '{{"schema_version":"satelle.bootstrap-recovery.v1","operation_id":"%s","reason":"stale heartbeat postcondition probes","process_probe":%s,"binary_probe":%s,"service_probe":%s,"daemon_probe":%s,"observed_at":"%s"}}\n' "$1" "$2" "$3" "$4" "$5" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$record"
+  printf '{{"schema_version":"satelle.bootstrap-recovery.v1","operation_id":"%s","reason":"stale heartbeat postcondition probes","process_probe":%s,"binary_probe":%s,"service_probe":%s,"daemon_probe":%s,"launcher_probe":%s,"observed_at":"%s"}}\n' "$1" "$2" "$3" "$4" "$5" "${{6:-null}}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$record"
   chmod 600 "$record"
+}}
+restart_launcher_status() {{
+  [ "${{#2}}" -le 1048576 ] || return 2
+  printf '%s\n' "$2" | awk -v self="$$" -v parent="$PPID" -v operation="$1" '
+    $1 != self && $1 != parent && (index($0, operation) ||
+      $0 ~ /(^|[[:space:]\/])launchctl[[:space:]]+(bootstrap|bootout|kickstart)([[:space:]]|$)/ ||
+      $0 ~ /(^|[[:space:]\/])systemctl[[:space:]].*(start|stop|restart)[[:space:]]+satelle-host/) {{ found=1 }}
+    END {{ exit !found }}'
 }}
 has_execution_markers() {{
   for marker in "$claim_path"/execution_started.* "$claim_path"/execution_retiring.* "$claim_path"/execution_succeeded.* "$claim_path"/execution_failed.* "$claim_path"/execution_committed.*; do
@@ -1077,6 +1085,13 @@ for competitor in "$lock_root"/*; do
       [ "$probe_status" -eq 1 ] && process_probe=false
     fi
   fi
+  launcher_probe=null
+  if [ "$mutation_phase" = persistent_service_restart ] && [ "$process_probe" != null ]; then
+    if restart_launcher_status "$observed" "$process_output"; then launcher_probe=true; else
+      probe_status=$?
+      [ "$probe_status" -eq 1 ] && launcher_probe=false
+    fi
+  fi
   process_active=false
   [ "$process_probe" = true ] && process_active=true
   binary_present=false
@@ -1112,7 +1127,7 @@ for competitor in "$lock_root"/*; do
   fi
   daemon_active=false
   [ "$daemon_probe" = true ] && daemon_active=true
-  record_recovery "$observed" "$process_probe" "$binary_present" "$service_probe" "$daemon_probe"
+  record_recovery "$observed" "$process_probe" "$binary_present" "$service_probe" "$daemon_probe" "$launcher_probe"
   terminal_evidence=false
   if [ "$requires_commit" = true ] && [ "$execution_committed" = true ]; then
     terminal_evidence=true
@@ -1148,9 +1163,21 @@ for competitor in "$lock_root"/*; do
     fi
     ;;
   esac
+  interrupted_service_restart=false
+  case "$claim_state" in mutation_started|recovery_pending)
+    if [ "$mutation_phase" = persistent_service_restart ] && [ "$execution_started" = true ] &&
+       [ "$execution_retiring" = false ] && [ "$execution_succeeded" = false ] &&
+       [ "$execution_failed" = false ] && [ "$execution_committed" = false ] &&
+       [ "$unexpected_execution_evidence" = false ] && [ "$launcher_probe" = false ] &&
+       [ "$process_probe" = false ] && [ "$service_probe" = false ] && [ "$daemon_probe" = false ]; then
+      interrupted_service_restart=true
+    fi
+    ;;
+  esac
   resolved_execution_evidence=false
   if [ "$execution_retiring" = true ] || [ "$terminal_evidence" = true ] ||
-     [ "$failed_daemon_start" = true ] || [ "$released_state_owner" = true ]; then
+     [ "$failed_daemon_start" = true ] || [ "$released_state_owner" = true ] ||
+     [ "$interrupted_service_restart" = true ]; then
     resolved_execution_evidence=true
   fi
   reconciled=false
@@ -1252,7 +1279,8 @@ for competitor in "$lock_root"/*; do
     restore_competitor
     busy
   fi
-  if [ "$failed_daemon_start" = true ] || [ "$released_state_owner" = true ]; then
+  if [ "$failed_daemon_start" = true ] || [ "$released_state_owner" = true ] ||
+     [ "$interrupted_service_restart" = true ]; then
     post_process_probe=null
     if process_output="$(ps -ww -eo pid=,args= 2>/dev/null)"; then
       if printf '%s\n' "$process_output" | awk -v self="$$" -v parent="$PPID" '$1 != self && $1 != parent && $0 ~ /(^|[[:space:]\/])satelle(\.exe)?[[:space:]]+host[[:space:]]+start([[:space:]]|$)/ {{ found=1 }} END {{ exit !found }}'; then
@@ -1260,6 +1288,13 @@ for competitor in "$lock_root"/*; do
       else
         probe_status=$?
         [ "$probe_status" -eq 1 ] && post_process_probe=false
+      fi
+    fi
+    post_launcher_probe=null
+    if [ "$interrupted_service_restart" = true ] && [ "$post_process_probe" != null ]; then
+      if restart_launcher_status "$observed" "$process_output"; then post_launcher_probe=true; else
+        probe_status=$?
+        [ "$probe_status" -eq 1 ] && post_launcher_probe=false
       fi
     fi
     post_service_probe=null
@@ -1285,13 +1320,28 @@ for competitor in "$lock_root"/*; do
         [ "$probe_status" -eq 7 ] && post_daemon_probe=false
       fi
     fi
-    record_recovery "$observed" "$post_process_probe" "$binary_present" "$post_service_probe" "$post_daemon_probe"
+    record_recovery "$observed" "$post_process_probe" "$binary_present" "$post_service_probe" "$post_daemon_probe" "$post_launcher_probe"
     if [ "$post_process_probe" != false ] || [ "$post_service_probe" != false ] || [ "$post_daemon_probe" != false ]; then
       restore_competitor
       busy
     fi
+    if [ "$interrupted_service_restart" = true ] && [ "$post_launcher_probe" != false ]; then
+      restore_competitor
+      busy
+    fi
   fi
-  rm -rf "$quarantine_root"
+  if [ "$interrupted_service_restart" = true ]; then
+    archive_root="$(mktemp -d "$state_root/bootstrap-recovered.$observed.$observed_identity.XXXXXX")" || {{ restore_competitor; busy; }}
+    chmod 700 "$archive_root"
+    if ! mv "$quarantined_claim" "$archive_root/claim" 2>/dev/null; then
+      rmdir "$archive_root" 2>/dev/null || true
+      restore_competitor
+      busy
+    fi
+    rmdir "$quarantine_root"
+  else
+    rm -rf "$quarantine_root"
+  fi
 done
 for competitor in "$lock_root"/*; do
   [ -e "$competitor" ] || continue
@@ -2639,6 +2689,153 @@ foreach ($body in @('satelle.exe host status', 'Write-Output unrelated')) {{
 
     #[cfg(unix)]
     #[test]
+    fn interrupted_service_restart_archives_only_with_inactive_executor_proof() {
+        let attempt = "0123456789abcdef0123456789abcdef";
+        let replacement =
+            Request::new("operation-2", OperationKind::MissingDaemonRepair, None).unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let state = home.path().join("satelle");
+        let claim = write_stale_mutation_claim(
+            &state.join("bootstrap.lock"),
+            "persistent_service_restart",
+            attempt,
+        );
+        fs::create_dir(claim.join(format!("execution_started.{attempt}"))).unwrap();
+        fs::create_dir(claim.join("mailbox")).unwrap();
+        fs::write(
+            claim.join("mailbox/original.stderr"),
+            b"original fixture output",
+        )
+        .unwrap();
+        let path = path_with_inactive_daemon_probe(home.path());
+        let mut recovered =
+            RunningProtocol::start_with_path(&replacement, home.path(), Some(&path));
+        assert_ready_line(&recovered.read_line());
+        recovered.exchange(RELEASE);
+        assert!(recovered.close().success());
+        assert!(!claim.exists());
+        let archives = fs::read_dir(&state)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("bootstrap-recovered.operation-1.")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(archives.len(), 1);
+        let original = archives[0].join("claim");
+        assert_eq!(
+            fs::read(original.join("mailbox/original.stderr")).unwrap(),
+            b"original fixture output"
+        );
+        assert!(
+            original
+                .join(format!("execution_started.{attempt}"))
+                .is_dir()
+        );
+        assert!(
+            !original
+                .join(format!("execution_committed.{attempt}"))
+                .exists()
+        );
+        assert_eq!(
+            fs::read_to_string(original.join("state")).unwrap().trim(),
+            "recovery_pending"
+        );
+        let report: serde_json::Value = serde_json::from_slice(
+            &fs::read(state.join("bootstrap-recovery-operation-1.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(report["launcher_probe"], false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn interrupted_service_restart_keeps_active_unknown_and_racing_executors_fenced() {
+        let attempt = "0123456789abcdef0123456789abcdef";
+        for (name, process_script, daemon_script, service_script) in [
+            (
+                "old wrapper",
+                "#!/bin/sh\nprintf '%s\\n' '999999 sh -c operation-1'\n",
+                "#!/bin/sh\nexit 7\n",
+                "#!/bin/sh\nexit 3\n",
+            ),
+            (
+                "launchd helper",
+                "#!/bin/sh\nprintf '%s\\n' '999999 /bin/launchctl bootstrap gui/501 service.plist'\n",
+                "#!/bin/sh\nexit 7\n",
+                "#!/bin/sh\nexit 3\n",
+            ),
+            (
+                "systemd helper",
+                "#!/bin/sh\nprintf '%s\\n' '999999 /usr/bin/systemctl --user restart satelle-host'\n",
+                "#!/bin/sh\nexit 7\n",
+                "#!/bin/sh\nexit 3\n",
+            ),
+            (
+                "unknown snapshot",
+                "#!/bin/sh\nexit 1\n",
+                "#!/bin/sh\nexit 7\n",
+                "#!/bin/sh\nexit 3\n",
+            ),
+            (
+                "active daemon",
+                "#!/bin/sh\nexit 0\n",
+                "#!/bin/sh\nprintf '200'\n",
+                "#!/bin/sh\nexit 3\n",
+            ),
+            (
+                "unknown listener",
+                "#!/bin/sh\nexit 0\n",
+                "#!/bin/sh\nexit 28\n",
+                "#!/bin/sh\nexit 3\n",
+            ),
+            (
+                "active service",
+                "#!/bin/sh\nexit 0\n",
+                "#!/bin/sh\nexit 7\n",
+                "#!/bin/sh\nexit 0\n",
+            ),
+            (
+                "unknown service",
+                "#!/bin/sh\nexit 0\n",
+                "#!/bin/sh\nexit 7\n",
+                "#!/bin/sh\nexit 1\n",
+            ),
+            (
+                "racing helper",
+                "#!/bin/sh\nif [ -e \"$XDG_STATE_HOME/probe-calls\" ]; then printf '%s\\n' '999999 sh -c operation-1'; else : >\"$XDG_STATE_HOME/probe-calls\"; fi\n",
+                "#!/bin/sh\nexit 7\n",
+                "#!/bin/sh\nexit 3\n",
+            ),
+        ] {
+            let home = tempfile::tempdir().unwrap();
+            let claim = write_stale_mutation_claim(
+                &home.path().join("satelle/bootstrap.lock"),
+                "persistent_service_restart",
+                attempt,
+            );
+            fs::create_dir(claim.join(format!("execution_started.{attempt}"))).unwrap();
+            let path = path_with_daemon_probe_script(home.path(), daemon_script);
+            fs::write(home.path().join("probe-bin/ps"), process_script).unwrap();
+            fs::write(home.path().join("probe-bin/systemctl"), service_script).unwrap();
+            let replacement =
+                Request::new("operation-2", OperationKind::MissingDaemonRepair, None).unwrap();
+            let mut contender =
+                RunningProtocol::start_with_path(&replacement, home.path(), Some(&path));
+            assert_eq!(contender.read_line(), BUSY, "{name}");
+            assert_eq!(contender.close().code(), Some(75), "{name}");
+            assert!(
+                claim.join(format!("execution_started.{attempt}")).is_dir(),
+                "{name}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn running_host_paths_keep_interrupted_release_fenced() {
         let attempt = "0123456789abcdef0123456789abcdef";
         for command in [
@@ -3303,7 +3500,17 @@ foreach ($body in @('satelle.exe host status', 'Write-Output unrelated')) {{
         let posix = request().posix_script();
         let windows = request().windows_script();
         for phase in &COMMIT_REQUIRED_MUTATION_PHASES[7..] {
-            assert_eq!(posix.matches(phase).count(), 5, "POSIX {phase}");
+            // Interrupted restart recovery checks this phase in both snapshots.
+            let posix_references = if *phase == "persistent_service_restart" {
+                7
+            } else {
+                5
+            };
+            assert_eq!(
+                posix.matches(phase).count(),
+                posix_references,
+                "POSIX {phase}"
+            );
             assert_eq!(windows.matches(phase).count(), 5, "Windows {phase}");
         }
         for phase in &SUCCESS_MUTATION_PHASES[4..] {
