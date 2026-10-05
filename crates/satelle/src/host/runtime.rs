@@ -2387,28 +2387,57 @@ impl RuntimeEngine {
         let Some(subject) = subject else {
             return Ok(());
         };
-        debug_assert_eq!(kind, subject.probe_kind());
-        if !subject.is_recovery_pending() {
-            return Err(readiness_probe_recovery_pending(kind));
+        if self.reconcile_probe_subject(&subject, driver)? {
+            Ok(())
+        } else {
+            Err(readiness_probe_recovery_pending(kind))
         }
-        match driver.observe_readiness_probe(&subject) {
+    }
+
+    fn reconcile_probe_subject(
+        &self,
+        subject: &crate::host::storage::ProbeRecoverySubject,
+        driver: &dyn ReadinessProbeDriver,
+    ) -> Result<bool, SatelleError> {
+        if !subject.is_recovery_pending() {
+            return Ok(false);
+        }
+        match driver.observe_readiness_probe(subject) {
             RecoveryObservation::Completed
             | RecoveryObservation::Blocked
             | RecoveryObservation::Failed => {
                 let mut storage = self.lock_storage()?;
-                match kind {
+                match subject.probe_kind() {
                     ReadinessProbeKind::Native => storage
                         .release_reconciled_native_probe(subject.probe_ref())
-                        .map_err(model::storage_failure),
+                        .map_err(model::storage_failure)?,
                     ReadinessProbeKind::Provider => storage
                         .release_reconciled_provider_probe(subject.probe_ref())
-                        .map_err(model::storage_failure),
+                        .map_err(model::storage_failure)?,
                 }
+                Ok(true)
             }
-            RecoveryObservation::Running | RecoveryObservation::Unknown => {
-                Err(readiness_probe_recovery_pending(kind))
-            }
+            RecoveryObservation::Running | RecoveryObservation::Unknown => Ok(false),
         }
+    }
+
+    fn reconcile_native_probes_for_maintenance(&self) -> Result<(), SatelleError> {
+        let Some(driver) = self.readiness_probe_driver.as_deref() else {
+            return Ok(());
+        };
+        let subjects = {
+            let storage = self.lock_storage()?;
+            let host_identity = storage.host_identity().map_err(model::storage_failure)?;
+            storage
+                .pending_native_probe_recoveries(&host_identity)
+                .map_err(model::storage_failure)?
+        };
+        // Reuse normal probe reconciliation without a new smoke test. Admission
+        // below remains authoritative when an observation cannot confirm termination.
+        for subject in subjects {
+            self.reconcile_probe_subject(&subject, driver)?;
+        }
+        Ok(())
     }
 
     fn has_reusable_readiness(&self, host: &str) -> Result<bool, SatelleError> {
@@ -3232,6 +3261,7 @@ impl RuntimeHandle {
     ) -> Result<MaintenanceOperationHandle, SatelleError> {
         let activity = self.activity.begin();
         let engine = self.engine()?;
+        engine.reconcile_native_probes_for_maintenance()?;
         let capability = {
             let mut storage = engine.lock_storage()?;
             let acquired_at = time::OffsetDateTime::now_utc();
