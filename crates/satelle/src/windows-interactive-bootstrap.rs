@@ -151,7 +151,33 @@ pub(super) fn bind_service_lifetime_to_parent() -> io::Result<()> {
     Ok(())
 }
 
-pub(super) fn relaunch() -> io::Result<ExitStatus> {
+/// Attached turns follow the controller; durable starts transfer ownership to
+/// the desktop task after the daemon confirms readiness through its private pipe.
+#[derive(Clone, Copy)]
+pub(super) enum BootstrapLifetime {
+    Attached,
+    Detached,
+}
+
+impl BootstrapLifetime {
+    fn powershell(self) -> &'static str {
+        match self {
+            Self::Attached => "$false",
+            Self::Detached => "$true",
+        }
+    }
+}
+
+pub(super) fn relaunch(
+    lifetime: BootstrapLifetime,
+    ready_timeout: std::time::Duration,
+) -> io::Result<ExitStatus> {
+    let ready_timeout_ms = i32::try_from(ready_timeout.as_millis()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "desktop bootstrap readiness budget exceeds the Windows pipe wait limit",
+        )
+    })?;
     let nonce = Uuid::now_v7().simple().to_string();
     let task_name = format!("SatelleInteractiveBootstrap-{nonce}");
     let pipe_prefix = format!("satelle-interactive-bootstrap-{nonce}");
@@ -165,8 +191,16 @@ pub(super) fn relaunch() -> io::Result<ExitStatus> {
         executable.as_os_str(),
         working_directory.as_os_str(),
         &arguments,
+        lifetime,
+        ready_timeout_ms,
     );
-    let parent_script = parent_script(&task_name, &pipe_prefix, &child_path);
+    let parent_script = parent_script(
+        &task_name,
+        &pipe_prefix,
+        &child_path,
+        lifetime,
+        ready_timeout_ms,
+    );
     let script_directory_guard =
         satelle::core::open_or_create_owner_only_directory(&script_directory)
             .map_err(|error| io::Error::other(error.to_string()))?;
@@ -334,7 +368,13 @@ fn current_arguments_without_boundary(mut arguments: Vec<OsString>) -> io::Resul
     Ok(arguments)
 }
 
-fn child_script(executable: &OsStr, working_directory: &OsStr, arguments: &[OsString]) -> String {
+fn child_script(
+    executable: &OsStr,
+    working_directory: &OsStr,
+    arguments: &[OsString],
+    lifetime: BootstrapLifetime,
+    ready_timeout_ms: i32,
+) -> String {
     let environment = DAEMON_PATH_ENVIRONMENT_VARIABLES
         .into_iter()
         .map(|name| {
@@ -346,19 +386,29 @@ fn child_script(executable: &OsStr, working_directory: &OsStr, arguments: &[OsSt
         .collect::<Vec<_>>()
         .join("\n");
     CHILD_SCRIPT_TEMPLATE
+        .replace("__DETACHED__", lifetime.powershell())
+        .replace("__READY_TIMEOUT_MS__", &ready_timeout_ms.to_string())
         .replace("__EXECUTABLE__", &utf16_base64(executable))
         .replace("__WORKING_DIRECTORY__", &utf16_base64(working_directory))
         .replace("__ARGUMENTS__", &utf16_base64(&quoted_arguments(arguments)))
         .replace("__ENVIRONMENT__", &environment)
 }
 
-fn parent_script(task_name: &str, pipe_prefix: &str, child_path: &Path) -> String {
+fn parent_script(
+    task_name: &str,
+    pipe_prefix: &str,
+    child_path: &Path,
+    lifetime: BootstrapLifetime,
+    ready_timeout_ms: i32,
+) -> String {
     let interactive_launch = crate::transport::windows_interactive_task_launch_script(
         r"\",
         task_name,
         "$identity.User.Value",
     );
     PARENT_SCRIPT_TEMPLATE
+        .replace("__DETACHED__", lifetime.powershell())
+        .replace("__READY_TIMEOUT_MS__", &ready_timeout_ms.to_string())
         .replace("__TASK_NAME__", task_name)
         .replace("__PIPE_PREFIX__", pipe_prefix)
         .replace("__CHILD_PATH__", &utf16_base64(child_path.as_os_str()))
@@ -478,6 +528,8 @@ __ENVIRONMENT__
 "#;
 
 const PARENT_SCRIPT_TEMPLATE: &str = r#"$ErrorActionPreference = 'Stop'
+$detached = __DETACHED__
+$handoffCommitted = $false
 $taskName = '__TASK_NAME__'
 $pipePrefix = '__PIPE_PREFIX__'
 $childPath = [System.Text.Encoding]::Unicode.GetString(
@@ -526,7 +578,7 @@ try {
     $stdoutConnect = $stdout.WaitForConnectionAsync()
     $stderrConnect = $stderr.WaitForConnectionAsync()
     __INTERACTIVE_LAUNCH__
-    if (-not $controlConnect.Wait(30000) -or -not $stdoutConnect.Wait(30000) -or -not $stderrConnect.Wait(30000)) {
+    if (-not $controlConnect.Wait(__READY_TIMEOUT_MS__) -or -not $stdoutConnect.Wait(__READY_TIMEOUT_MS__) -or -not $stderrConnect.Wait(__READY_TIMEOUT_MS__)) {
         throw 'The interactive bootstrap task did not connect its private pipes.'
     }
 
@@ -537,19 +589,38 @@ try {
     $controlReader = New-Object System.IO.StreamReader($control, $utf8, $false, 1024, $true)
     $controlWriter.WriteLine([Convert]::ToBase64String($utf8.GetBytes($token)))
     $token = $null
-    $stdoutCopy = $stdout.CopyToAsync([Console]::OpenStandardOutput())
-    $stderrCopy = $stderr.CopyToAsync([Console]::OpenStandardError())
-    $exitLine = $controlReader.ReadLine()
-    [void]$stdoutCopy.GetAwaiter().GetResult()
-    [void]$stderrCopy.GetAwaiter().GetResult()
-    if (-not [int]::TryParse($exitLine, [ref]$exitCode)) {
-        throw 'The interactive bootstrap task returned an invalid exit status.'
+    if ($detached) {
+        $ready = $controlReader.ReadLineAsync()
+        if (-not $ready.Wait(__READY_TIMEOUT_MS__) -or $ready.GetAwaiter().GetResult() -ne 'detached-ready') {
+            throw 'The desktop daemon did not become ready for ownership transfer.'
+        }
+        $controlWriter.WriteLine('detached-commit')
+        $committed = $controlReader.ReadLineAsync()
+        if (-not $committed.Wait(__READY_TIMEOUT_MS__) -or $committed.GetAwaiter().GetResult() -ne 'detached-committed') {
+            throw 'The desktop task did not confirm daemon ownership.'
+        }
+        $handoffCommitted = $true
+        $exitCode = 0
+    } else {
+        $stdoutCopy = $stdout.CopyToAsync([Console]::OpenStandardOutput())
+        $stderrCopy = $stderr.CopyToAsync([Console]::OpenStandardError())
+        $exitLine = $controlReader.ReadLine()
+        [void]$stdoutCopy.GetAwaiter().GetResult()
+        [void]$stderrCopy.GetAwaiter().GetResult()
+        if (-not [int]::TryParse($exitLine, [ref]$exitCode)) {
+            throw 'The interactive bootstrap task returned an invalid exit status.'
+        }
     }
 } catch {
     [Console]::Error.WriteLine("satelle-host: interactive bootstrap relay failed: $($_.Exception.Message)")
     $exitCode = 1
 } finally {
-    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+    if (-not $handoffCommitted) {
+        # Unregistering a task does not stop its active process. Stopping this
+        # exact owner also closes the daemon's kill-on-close job handle.
+        Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+    }
     $stderr.Dispose()
     $stdout.Dispose()
     $control.Dispose()
@@ -564,6 +635,7 @@ const CHILD_SCRIPT_TEMPLATE: &str = r#"param(
     [Parameter(Mandatory = $true)][string]$StderrPipe
 )
 $ErrorActionPreference = 'Stop'
+$detached = __DETACHED__
 $control = New-Object System.IO.Pipes.NamedPipeClientStream(
     '.', $ControlPipe, [System.IO.Pipes.PipeDirection]::InOut,
     [System.IO.Pipes.PipeOptions]::Asynchronous
@@ -583,9 +655,9 @@ $stdoutCopy = $null
 $stderrCopy = $null
 $exitCode = 1
 try {
-    $control.Connect(30000)
-    $stdout.Connect(30000)
-    $stderr.Connect(30000)
+    $control.Connect(__READY_TIMEOUT_MS__)
+    $stdout.Connect(__READY_TIMEOUT_MS__)
+    $stderr.Connect(__READY_TIMEOUT_MS__)
     $utf8 = New-Object System.Text.UTF8Encoding($false)
     $controlReader = New-Object System.IO.StreamReader($control, $utf8, $false, 1024, $true)
     $controlWriter = New-Object System.IO.StreamWriter($control, $utf8, 1024, $true)
@@ -629,20 +701,38 @@ __ENVIRONMENT__
     $process.StandardInput.Close()
     $token = $null
     $encodedToken = $null
-    $stdoutCopy = $process.StandardOutput.BaseStream.CopyToAsync($stdout)
-    $stderrCopy = $process.StandardError.BaseStream.CopyToAsync($stderr)
-    $disconnectProbe = New-Object byte[] 1
-    $parentClosed = $control.ReadAsync($disconnectProbe, 0, 1)
-    while (-not $process.WaitForExit(500)) {
-        if ($parentClosed.IsCompleted -and $parentClosed.GetAwaiter().GetResult() -eq 0) {
-            $process.Kill()
-            throw 'The SSH bootstrap controller disconnected.'
+    if ($detached) {
+        # Drain diagnostics while readiness is pending. No daemon output owns
+        # the SSH pipe after the task accepts the ownership transfer.
+        $stderrCopy = $process.StandardError.BaseStream.CopyToAsync([System.IO.Stream]::Null)
+        $ready = $process.StandardOutput.ReadLineAsync()
+        if (-not $ready.Wait(__READY_TIMEOUT_MS__) -or [string]::IsNullOrEmpty($ready.GetAwaiter().GetResult())) {
+            throw 'The desktop daemon did not emit its ready frame.'
+        }
+        $stdoutCopy = $process.StandardOutput.BaseStream.CopyToAsync([System.IO.Stream]::Null)
+        $controlWriter.WriteLine('detached-ready')
+        $commit = $controlReader.ReadLineAsync()
+        if (-not $commit.Wait(__READY_TIMEOUT_MS__) -or $commit.GetAwaiter().GetResult() -ne 'detached-commit') {
+            throw 'The SSH bootstrap controller did not commit daemon ownership.'
+        }
+        $controlWriter.WriteLine('detached-committed')
+        $process.WaitForExit()
+    } else {
+        $stdoutCopy = $process.StandardOutput.BaseStream.CopyToAsync($stdout)
+        $stderrCopy = $process.StandardError.BaseStream.CopyToAsync($stderr)
+        $disconnectProbe = New-Object byte[] 1
+        $parentClosed = $control.ReadAsync($disconnectProbe, 0, 1)
+        while (-not $process.WaitForExit(500)) {
+            if ($parentClosed.IsCompleted -and $parentClosed.GetAwaiter().GetResult() -eq 0) {
+                $process.Kill()
+                throw 'The SSH bootstrap controller disconnected.'
+            }
         }
     }
     [void]$stdoutCopy.GetAwaiter().GetResult()
     [void]$stderrCopy.GetAwaiter().GetResult()
     $exitCode = $process.ExitCode
-    $controlWriter.WriteLine([string]$exitCode)
+    if (-not $detached) { $controlWriter.WriteLine([string]$exitCode) }
 } catch {
     if ($processStarted -and -not $process.HasExited) {
         $process.Kill()
@@ -799,18 +889,119 @@ mod tests {
     }
 
     #[test]
+    fn detached_task_keeps_daemon_alive_after_private_relay_disconnects() {
+        let directory = tempfile::tempdir().expect("private relay fixture");
+        let child_path = directory.path().join("relay.ps1");
+        let pid_path = directory.path().join("daemon.pid");
+        let receipt_path = directory.path().join("token.receipt");
+        let stop_path = directory.path().join("daemon.stop");
+        let fixture = format!(
+            "[IO.File]::WriteAllText('{}',[string]$PID); $token=[Console]::In.ReadToEnd(); [IO.File]::WriteAllText('{}',$token); [Console]::Out.WriteLine('ready'); [Console]::Out.Flush(); $deadline=[DateTime]::UtcNow.AddSeconds(120); while (-not [IO.File]::Exists('{}') -and [DateTime]::UtcNow -lt $deadline) {{ Start-Sleep -Milliseconds 100 }}",
+            pid_path.display().to_string().replace('\'', "''"),
+            receipt_path.display().to_string().replace('\'', "''"),
+            stop_path.display().to_string().replace('\'', "''"),
+        );
+        let child = child_script(
+            windows_powershell_path().unwrap().as_os_str(),
+            directory.path().as_os_str(),
+            &[
+                OsString::from("-NoProfile"),
+                OsString::from("-NonInteractive"),
+                OsString::from("-Command"),
+                OsString::from(fixture),
+            ],
+            BootstrapLifetime::Detached,
+            30000,
+        );
+        write_windows_powershell_script(&child_path, &child).unwrap();
+        let prefix = format!("satelle-test-{}", Uuid::now_v7().simple());
+        let harness = format!(
+            r#"$ErrorActionPreference = 'Stop'
+$decode = {{ param($value) [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($value)) }}
+$childPath = & $decode '{child_path}'
+$pidPath = & $decode '{pid_path}'
+$receiptPath = & $decode '{receipt_path}'
+$stopPath = & $decode '{stop_path}'
+$control = New-Object IO.Pipes.NamedPipeServerStream('{prefix}-control',[IO.Pipes.PipeDirection]::InOut,1,[IO.Pipes.PipeTransmissionMode]::Byte,[IO.Pipes.PipeOptions]::Asynchronous)
+$stdout = New-Object IO.Pipes.NamedPipeServerStream('{prefix}-stdout',[IO.Pipes.PipeDirection]::In,1,[IO.Pipes.PipeTransmissionMode]::Byte,[IO.Pipes.PipeOptions]::Asynchronous)
+$stderr = New-Object IO.Pipes.NamedPipeServerStream('{prefix}-stderr',[IO.Pipes.PipeDirection]::In,1,[IO.Pipes.PipeTransmissionMode]::Byte,[IO.Pipes.PipeOptions]::Asynchronous)
+$relay = $null
+try {{
+    $connections = @($control.WaitForConnectionAsync(),$stdout.WaitForConnectionAsync(),$stderr.WaitForConnectionAsync())
+    $arguments = "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$childPath`" -TaskName SatelleTest-{prefix} -ControlPipe {prefix}-control -StdoutPipe {prefix}-stdout -StderrPipe {prefix}-stderr"
+    $relay = Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') -ArgumentList $arguments -WindowStyle Hidden -PassThru
+    [void]$relay.Handle
+    foreach ($connection in $connections) {{ if (-not $connection.Wait(30000)) {{ throw 'fixture pipe connection timed out' }} }}
+    $utf8 = New-Object Text.UTF8Encoding($false)
+    $writer = New-Object IO.StreamWriter($control,$utf8,1024,$true)
+    $writer.AutoFlush = $true
+    $reader = New-Object IO.StreamReader($control,$utf8,$false,1024,$true)
+    $writer.WriteLine([Convert]::ToBase64String($utf8.GetBytes('private-fixture-token')))
+    $ready = $reader.ReadLineAsync()
+    if (-not $ready.Wait(30000) -or $ready.GetAwaiter().GetResult() -ne 'detached-ready') {{ throw 'fixture readiness failed' }}
+    $writer.WriteLine('detached-commit')
+    $committed = $reader.ReadLineAsync()
+    if (-not $committed.Wait(30000) -or $committed.GetAwaiter().GetResult() -ne 'detached-committed') {{ throw 'fixture ownership failed' }}
+    $control.Dispose(); $stdout.Dispose(); $stderr.Dispose()
+    if ($relay.WaitForExit(1500)) {{ throw 'desktop relay exited with its SSH controller' }}
+    $daemonId = [int][IO.File]::ReadAllText($pidPath)
+    if ($null -eq (Get-Process -Id $daemonId -ErrorAction SilentlyContinue)) {{ throw 'daemon exited with its SSH controller' }}
+    if ([IO.File]::ReadAllText($receiptPath) -cne 'private-fixture-token') {{ throw 'private token was not delivered exactly' }}
+    [IO.File]::WriteAllText($stopPath, 'stop')
+    if (-not $relay.WaitForExit(10000) -or $relay.ExitCode -ne 0) {{ throw 'desktop relay failed to follow daemon exit' }}
+}} finally {{
+    if (Test-Path -LiteralPath $pidPath) {{ Stop-Process -Id ([int][IO.File]::ReadAllText($pidPath)) -Force -ErrorAction SilentlyContinue }}
+    if ($null -ne $relay) {{ if (-not $relay.HasExited) {{ $relay.Kill() }}; $relay.Dispose() }}
+    $control.Dispose(); $stdout.Dispose(); $stderr.Dispose()
+}}
+"#,
+            child_path = utf16_base64(child_path.as_os_str()),
+            pid_path = utf16_base64(pid_path.as_os_str()),
+            receipt_path = utf16_base64(receipt_path.as_os_str()),
+            stop_path = utf16_base64(stop_path.as_os_str()),
+        );
+        let harness_path = directory.path().join("harness.ps1");
+        write_windows_powershell_script(&harness_path, &harness).unwrap();
+        let output = Command::new(windows_powershell_path().unwrap())
+            .creation_flags(winapi::um::winbase::CREATE_NO_WINDOW)
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+            ])
+            .arg(harness_path)
+            .output()
+            .expect("run production private desktop relay");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
     fn generated_scripts_keep_token_out_of_persisted_task_inputs() {
         let parent = parent_script(
             "SatelleInteractiveBootstrap-test",
             "satelle-interactive-bootstrap-test",
             Path::new(r"C:\Temp\bootstrap child.ps1"),
+            BootstrapLifetime::Attached,
+            510000,
         );
         let child = child_script(
             OsStr::new(r"C:\Satelle\satelle.exe"),
             OsStr::new(r"C:\Satelle"),
             &[OsString::from("host"), OsString::from("start")],
+            BootstrapLifetime::Attached,
+            510000,
         );
 
+        assert!(parent.contains("$controlConnect.Wait(510000)"));
+        assert!(parent.contains("$ready.Wait(510000)"));
+        assert!(child.contains("$control.Connect(510000)"));
+        assert!(child.contains("$ready.Wait(510000)"));
         assert!(parent.contains("[Console]::In.ReadToEnd()"));
         assert!(parent.contains("ToBase64String($utf8.GetBytes($token))"));
         assert!(parent.contains("WTSEnumerateSessionsW"));

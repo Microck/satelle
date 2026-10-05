@@ -48,7 +48,7 @@ const PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
 // claim.
 const BOOTSTRAP_READY_SLACK: Duration = Duration::from_secs(30);
 
-fn windows_bootstrap_ready_timeout(native: Duration, provider: Duration) -> Duration {
+pub(crate) fn windows_bootstrap_ready_timeout(native: Duration, provider: Duration) -> Duration {
     native
         .saturating_add(provider)
         .saturating_add(BOOTSTRAP_READY_SLACK)
@@ -797,6 +797,7 @@ impl SshBootstrapLock {
                     exchange_failed: Arc::clone(&self.exchange_failed),
                     phase: phase.to_string(),
                     attempt: attempt.clone(),
+                    timeout: PROCESS_TIMEOUT,
                 }),
             windows_input_paths,
         })
@@ -1099,7 +1100,11 @@ impl SshBootstrapProcess {
             &environment,
             host_config.into(),
         );
-        let command = bootstrap_lock.fenced_command(target, "daemon_start", &command)?;
+        let mut command = bootstrap_lock.fenced_command(target, "daemon_start", &command)?;
+        if let Some(probe) = command.windows_result_probe.as_mut() {
+            // The desktop handoff now waits for daemon readiness, not only spawn.
+            probe.timeout = windows_bootstrap_ready_timeout(native_timeout, provider_timeout);
+        }
         let output = run_fenced_ssh_command(
             destination,
             target,
@@ -3150,7 +3155,9 @@ printf 'removed=%s\nretained=%s\n' "$removed" "$retained""#,
                     "if (-not $process.Start()) {{ throw 'satelle-bootstrap-stage:process-start;' }}; ",
                     "$diagnosticStage = 'bootstrap-token'; $token = [Console]::In.ReadLine(); ",
                     "if ([String]::IsNullOrEmpty($token)) {{ $process.Kill(); throw 'satelle-bootstrap-stage:bootstrap-token;' }}; ",
-                    "$process.StandardInput.WriteLine($token); $process.StandardInput.Close() ",
+                    "$process.StandardInput.WriteLine($token); $process.StandardInput.Close(); ",
+                    "$diagnosticStage = 'desktop-handoff'; $process.WaitForExit(); ",
+                    "if ($process.ExitCode -ne 0) {{ throw 'satelle-bootstrap-stage:desktop-handoff;' }} ",
                     "}} finally {{ ",
                     "$restoreInput = [SatelleBootstrapNative]::SetStdHandle(-10,$originalInput); ",
                     "$restoreOutput = [SatelleBootstrapNative]::SetStdHandle(-11,$originalOutput); ",
@@ -7017,6 +7024,7 @@ struct WindowsFencedResultProbe {
     exchange_failed: Arc<AtomicBool>,
     phase: String,
     attempt: String,
+    timeout: Duration,
 }
 
 fn wait_for_windows_mutation_result(
@@ -7208,7 +7216,7 @@ fn run_fenced_ssh_command_with_output_limit(
             // mailbox result and then retire only the stuck transport process.
             let output = (|| {
                 let status = wait_for_windows_mutation_result(
-                    Instant::now() + PROCESS_TIMEOUT,
+                    Instant::now() + probe.timeout,
                     &probe.exchange_failed,
                     |remaining| {
                         probe
