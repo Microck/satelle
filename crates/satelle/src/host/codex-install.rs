@@ -800,8 +800,7 @@ fn extract_and_validate_package(
             .map_err(|error| install_error("extract-codex-package", error))?
             & 0o111
             != 0;
-        io::copy(&mut entry, &mut output)
-            .map_err(|error| install_error("extract-codex-package", error))?;
+        io::copy(&mut entry, &mut output).map_err(extraction_io_error)?;
         #[cfg(unix)]
         if executable {
             use std::os::unix::fs::PermissionsExt;
@@ -809,12 +808,23 @@ fn extract_and_validate_package(
                 .set_permissions(fs::Permissions::from_mode(0o700))
                 .map_err(|error| install_error("extract-codex-package", error))?;
         }
-        output
-            .sync_all()
-            .map_err(|error| install_error("extract-codex-package", error))?;
+        output.sync_all().map_err(extraction_io_error)?;
     }
 
     validate_package_manifest(destination, expected_target, expected_version)
+}
+
+// Keep the actionable storage cause public without exposing the OS error's paths or text.
+fn extraction_io_error(source: io::Error) -> SatelleError {
+    let disk_full = source.kind() == io::ErrorKind::StorageFull;
+    let mut error = install_error("extract-codex-package", source);
+    if disk_full {
+        error.message = "Codex installation ran out of disk space. Free disk space on the installation drive and repeat the same setup command.".to_string();
+        error
+            .details
+            .insert("storage_reason".to_string(), json!("disk_full"));
+    }
+    error
 }
 
 fn ensure_owner_only_archive_directories(
@@ -1732,6 +1742,27 @@ mod tests {
     #[test]
     fn managed_install_errors_defer_the_exact_target_recovery_to_the_controller() {
         assert_eq!(install_error("fixture", "failure").recovery_command, None);
+    }
+
+    #[test]
+    fn extraction_disk_full_error_is_actionable_without_private_diagnostics() {
+        let error = extraction_io_error(io::Error::new(
+            io::ErrorKind::StorageFull,
+            "PRIVATE_INSTALL_PATH: disk full",
+        ));
+        assert_eq!(error.code, ErrorCode::SetupActionFailed);
+        assert_eq!(error.details["storage_reason"], "disk_full");
+        assert_eq!(error.details["failed_action"], "extract-codex-package");
+        assert_eq!(error.details["changed"], false);
+        assert!(error.message.contains("Free disk space"));
+        assert!(!error.message.contains("PRIVATE_INSTALL_PATH"));
+        assert_eq!(error.recovery_command, None);
+        let other = extraction_io_error(io::Error::from(io::ErrorKind::PermissionDenied));
+        assert!(!other.details.contains_key("storage_reason"));
+        assert_eq!(
+            other.message,
+            "managed Codex setup action 'extract-codex-package' failed"
+        );
     }
 
     #[test]

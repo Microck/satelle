@@ -7322,8 +7322,23 @@ fn managed_setup_failure_reconciles_only_a_validated_no_change_result() {
             error: Box::new(error),
         }
     ));
+    let full = map_managed_setup_api_error(
+        "tailnet-host",
+        satelle::core::SetupMode::Persistent,
+        "codex",
+        &api_error(
+            serde_json::json!({"failed_action":"extract-codex-package", "changed":false, "storage_reason":"disk_full"}),
+        ),
+    );
+    assert_eq!(full.details["storage_reason"], "disk_full");
+    assert!(full.message.contains("Free disk space"));
+    assert!(managed_setup_failure_is_reconciled(&full));
+    assert_eq!(full.recovery_command, mapped.recovery_command);
     for details in [
         serde_json::Value::Null,
+        serde_json::json!({"failed_action": "extract-codex-package", "changed": false, "storage_reason": "PRIVATE_REASON"}),
+        serde_json::json!({"failed_action": "extract-codex-package", "changed": true, "storage_reason": "disk_full"}),
+        serde_json::json!({"failed_action": "prepare-package-root", "changed": false, "storage_reason": "disk_full"}),
         serde_json::json!({"failed_action": "prepare-package-root"}),
         serde_json::json!({"failed_action": "prepare-package-root", "changed": "false"}),
         serde_json::json!({"failed_action": "private/path", "changed": false}),
