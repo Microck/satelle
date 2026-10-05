@@ -1,3 +1,9 @@
+## satelle@0.1.31
+
+### Quiet background commands
+
+Hide background SSH, update, telemetry and batch helper processes on Windows. Preserve interactive terminals and app-access or operating-system approval prompts.
+
 ## satelle@0.1.30
 
 ### Background Windows hosts
