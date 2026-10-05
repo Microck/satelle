@@ -15,7 +15,7 @@ const HOST_KEY_FAILURE_MARKERS: [&[u8]; 2] = [
     b"REMOTE HOST IDENTIFICATION HAS CHANGED!",
 ];
 
-const WINDOWS_BOOTSTRAP_FAILURE_MARKERS: [(&[u8], &str); 17] = [
+const WINDOWS_BOOTSTRAP_FAILURE_MARKERS: [(&[u8], &str); 18] = [
     (b"satelle-bootstrap-stage:native-helper;", "native-helper"),
     (b"satelle-bootstrap-stage:null-output;", "null-output"),
     (b"satelle-bootstrap-stage:binary-path;", "binary-path"),
@@ -48,6 +48,10 @@ const WINDOWS_BOOTSTRAP_FAILURE_MARKERS: [(&[u8], &str); 17] = [
         "bootstrap-token",
     ),
     (b"satelle-bootstrap-stage:handle-restore;", "handle-restore"),
+    (
+        b"satelle-bootstrap-stage:desktop-handoff;",
+        "desktop-handoff",
+    ),
 ];
 
 pub(super) struct SshTunnel {

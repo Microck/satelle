@@ -10511,12 +10511,32 @@ fn start_host_daemon(
         #[cfg(windows)]
         {
             validate_host_start_mode(&command).map_err(failure)?;
-            let status = windows_interactive_bootstrap::relaunch().map_err(|error| {
-                failure(SatelleError::config_error(
-                    format!("could not enter the authenticated Windows desktop session: {error}"),
-                    None,
-                ))
-            })?;
+            let lifetime = if command.on_demand_idle_timeout_ms.is_some() {
+                windows_interactive_bootstrap::BootstrapLifetime::Detached
+            } else {
+                windows_interactive_bootstrap::BootstrapLifetime::Attached
+            };
+            let mut host_config = satelle::core::SatelleConfig::defaults()
+                .hosts
+                .remove(LOCAL_DEMO_HOST)
+                .expect("the built-in local Host config exists");
+            host_config.timeouts = ssh_launch_readiness_timeouts(
+                command.bootstrap_native_readiness_timeout_ms,
+                command.bootstrap_provider_smoke_timeout_ms,
+            )
+            .map_err(failure)?;
+            let (native, provider) = satelle::host::readiness_probe_timeouts(&host_config);
+            let ready_timeout = transport::windows_bootstrap_ready_timeout(native, provider);
+            let status = windows_interactive_bootstrap::relaunch(lifetime, ready_timeout).map_err(
+                |error| {
+                    failure(SatelleError::config_error(
+                        format!(
+                            "could not enter the authenticated Windows desktop session: {error}"
+                        ),
+                        None,
+                    ))
+                },
+            )?;
             if status.success() {
                 return Ok(());
             }
@@ -10571,6 +10591,17 @@ fn start_host_daemon_with(
     ) -> HostService,
 ) -> Result<(), CliFailure> {
     validate_host_start_mode(&command).map_err(failure)?;
+    #[cfg(windows)]
+    if command.bootstrap_token_stdin && command.on_demand_idle_timeout_ms.is_some() {
+        // The desktop task owns the durable daemon after the SSH relay exits.
+        windows_interactive_bootstrap::bind_service_lifetime_to_parent().map_err(|error| {
+            failure(SatelleError::config_error(
+                format!("could not bind the durable daemon to its desktop task: {error}"),
+                None,
+            ))
+        })?;
+    }
+
     let local_daemon_launch = command
         .local_daemon_config
         .as_deref()

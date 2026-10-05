@@ -311,6 +311,8 @@ mod ssh_bootstrap;
 mod ssh_tunnel;
 
 use ssh_bootstrap::SshBootstrapProcess;
+#[cfg(windows)]
+pub(crate) use ssh_bootstrap::windows_bootstrap_ready_timeout;
 pub(crate) use ssh_bootstrap::{CacheCleanupReport, RawSubprocessCapture};
 use ssh_tunnel::SshTunnel;
 
