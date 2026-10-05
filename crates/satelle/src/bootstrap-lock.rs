@@ -2095,6 +2095,76 @@ foreach ($mode in @([IO.FileMode]::CreateNew, [IO.FileMode]::Create)) {{
         );
     }
 
+    #[cfg(all(unix, feature = "test-support"))]
+    #[test]
+    fn posix_interrupted_begin_recovers_the_producers_independent_claim_nonce() {
+        let state_home =
+            satelle::host::test_support::TestStateDir::new().expect("private canonical state home");
+        let store = state_home.path().join("store");
+        let service = satelle::host::HostService::local_demo_for_tests_at(&store)
+            .expect("create original Host store");
+        let host_identity = service
+            .initialize_daemon()
+            .unwrap()
+            .host_identity()
+            .to_string();
+        drop(service);
+        let bootstrap = state_home.path().join("satelle");
+        let mut protocol = RunningProtocol::start(&request(), state_home.path());
+        let ready = protocol.read_line();
+        assert_ready_line(&ready);
+        let identity = ready.split(' ').nth(1).unwrap();
+        let claim = only_claim(&bootstrap.join("bootstrap.lock"));
+        assert_ne!(
+            claim.file_name().unwrap().to_str().unwrap(),
+            format!("claim.operation-1.{identity}")
+        );
+        let attempt = "0123456789abcdef0123456789abcdef";
+        protocol.exchange(&mutation_started_line("setup_maintenance_begin", attempt).unwrap());
+        let marker = claim.join(format!("execution_started.{attempt}"));
+        fs::create_dir(&marker).unwrap();
+        fs::set_permissions(&marker, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(protocol.close().success());
+        // Model an elapsed heartbeat after the real producer lost its input.
+        fs::write(claim.join("heartbeat_at"), "2026-01-01T00:00:00Z\n").unwrap();
+        let plan = satelle::host::HostService::recover_bootstrap_begin_without_run(
+            &store,
+            &bootstrap,
+            &host_identity,
+            "operation-1",
+            false,
+        )
+        .unwrap();
+        assert!(!plan.changed);
+        assert!(claim.is_dir());
+        let recovered = satelle::host::HostService::recover_bootstrap_begin_without_run(
+            &store,
+            &bootstrap,
+            &host_identity,
+            "operation-1",
+            true,
+        )
+        .unwrap();
+        assert!(recovered.changed);
+        assert!(!claim.exists());
+        assert_eq!(
+            fs::read_to_string(recovered.archive_path.join("claim_identity"))
+                .unwrap()
+                .trim(),
+            identity
+        );
+        assert!(
+            recovered
+                .archive_path
+                .join(format!("execution_started.{attempt}"))
+                .is_dir()
+        );
+        assert_eq!(
+            fs::read(recovered.archive_path.join("recovery.json")).unwrap(),
+            serde_json::to_vec(&recovered).unwrap()
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn posix_protocol_recovers_only_the_observed_stale_live_owner() {
