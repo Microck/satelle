@@ -1515,10 +1515,12 @@ fn native_readiness_prompt(
             if !allowed_app_ids.contains("satelle.exe") {
                 return Err("native_app_approval_unavailable");
             }
-            // The native probe has a borderless physical-pixel layout. Coordinate input keeps
-            // this generated cell short enough for the model to copy verbatim,
-            // while the private callback remains the authority for both events.
-            let script = "globalThis.sky??=(await import('@oai/sky')).sky;var w=(await sky.list_windows()).find(x=>x.app.toLowerCase().endsWith('satelle.exe')&&x.title==='Satelle native readiness probe'),g=w=>sky.get_window_state({window:w,include_screenshot:true,include_text:true}),s=await g(w);await sky.click({window:s.window,x:190,y:142,screenshotId:s.screenshots[0].id});s=await g(s.window);await sky.drag({window:s.window,from_x:230,from_y:325,to_x:660,to_y:430,screenshotId:s.screenshots[0].id})".to_string();
+            // Sky screenshots and input coordinates use logical pixels. The owned
+            // borderless window uses a fixed physical layout; derive its target
+            // positions from the current screenshot instead of assuming 100% DPI.
+            // Missing dimensions fail before input. Independent native events
+            // remain the completion authority.
+            let script = "globalThis.sky??=(await import('@oai/sky')).sky;var w=(await sky.list_windows()).find(x=>x.app.toLowerCase().endsWith('satelle.exe')&&x.title==='Satelle native readiness probe'),g=async w=>{var s=await sky.get_window_state({window:w}),q=s.screenshots[0];if(!(q?.width>0&&q.height>0))throw Error('native screenshot dimensions missing');return s},s=await g(w),X=x=>x*s.screenshots[0].width/1024,Y=y=>y*s.screenshots[0].height/678;await sky.click({window:s.window,x:X(190),y:Y(142),screenshotId:s.screenshots[0].id});s=await g(s.window);await sky.drag({window:s.window,from_x:X(230),from_y:Y(325),to_x:X(660),to_y:Y(430),screenshotId:s.screenshots[0].id})".to_string();
             // The `exec` tool yields after roughly ten seconds and reports a
             // background cell instead of a result. On slow hosts the readiness
             // script outlives that window, and a model that obeys "no other
@@ -5047,10 +5049,10 @@ mod tests {
         assert!(!prompt.contains("sky.type_text"));
         assert!(prompt.contains("sky.get_window_state({window:w"));
         assert!(!prompt.contains("accessibility.tree"));
-        assert!(prompt.contains("sky.click({window:s.window,x:190,y:142"));
-        assert!(
-            prompt.contains("sky.drag({window:s.window,from_x:230,from_y:325,to_x:660,to_y:430")
-        );
+        assert!(prompt.contains("sky.click({window:s.window,x:X(190),y:Y(142)"));
+        assert!(prompt.contains(
+            "sky.drag({window:s.window,from_x:X(230),from_y:Y(325),to_x:X(660),to_y:Y(430)"
+        ));
         assert!(prompt.contains("screenshotId:s.screenshots[0].id"));
         let click = prompt
             .find("await sky.click({window:s.window")
@@ -5080,7 +5082,75 @@ mod tests {
             .expected_authorization()
             .expect("the exact script must retain its checked app authority");
         assert_eq!(authorized_app_id, "satelle.exe");
-        assert!(authorized_script.len() <= 512);
+        // Keep the exact cell bounded while including current screenshot geometry.
+        assert!(authorized_script.len() <= 768);
+    }
+
+    #[test]
+    fn windows_readiness_script_uses_each_current_logical_screenshot() {
+        let evidence = crate::host::provider_probe::NativeActionEvidence::new();
+        native_readiness_prompt(
+            "http://127.0.0.1:12345/probe/private-capability",
+            &crate::host::codex_capabilities::NativeComputerUseActionPath::WindowsNodeRepl,
+            &BTreeSet::from(["satelle.exe".to_string()]),
+            &evidence,
+        )
+        .expect("the Windows readiness script has current app authority");
+        let (script, _) = evidence.expected_authorization().unwrap();
+        // Execute the exact authorized JavaScript against a stateful native-client
+        // fixture. Its bounds and physical target checks are independent of the
+        // generated coordinate expressions; this is not native acceptance proof.
+        let fixture = r#"
+import assert from 'node:assert/strict';
+const script = SCRIPT;
+for (const scale of [1, 1.25, 1.5, 1.75, 2]) {
+  let captures = 0, clicks = 0, drags = 0;
+  const window = {app:'C:\\Satelle\\satelle.exe',id:1,title:'Satelle native readiness probe'};
+  const screenshot = () => ({id:String(captures),width:Math.floor(1024/scale),height:Math.floor(678/scale)});
+  const physical = (x,y) => [x*1024/screenshot().width,y*678/screenshot().height];
+  globalThis.sky = {
+    list_windows: async () => [window],
+    get_window_state: async ({window:w}) => {
+      assert.equal(w,window); captures++;
+      return {window,screenshots:[screenshot()]};
+    },
+    click: async ({window:w,x,y,screenshotId}) => {
+      assert.equal(w,window); assert.equal(screenshotId,'1');
+      const [px,py]=physical(x,y);
+      assert(px>80&&px<300&&py>115&&py<170); clicks++;
+    },
+    drag: async ({window:w,from_x,from_y,to_x,to_y,screenshotId}) => {
+      assert.equal(w,window); assert.equal(screenshotId,'2');
+      assert(to_x<screenshot().width&&to_y<screenshot().height);
+      const [sx,sy]=physical(from_x,from_y),[tx,ty]=physical(to_x,to_y);
+      assert(sx>140&&sx<320&&sy>260&&sy<390);
+      assert(tx>560&&tx<760&&ty>365&&ty<495); drags++;
+    }
+  };
+  await new Function('return (async()=>{'+script+'})()')();
+  assert.equal(captures,2); assert.equal(clicks,1); assert.equal(drags,1);
+}
+for (const dimensions of [{},{width:0,height:678},{width:1024,height:-1}]) {
+  let inputs=0;
+  globalThis.sky={
+    list_windows:async()=>[{app:'satelle.exe',title:'Satelle native readiness probe'}],
+    get_window_state:async()=>({window:{},screenshots:[dimensions]}),
+    click:async()=>{inputs++}, drag:async()=>{inputs++}
+  };
+  await assert.rejects(new Function('return (async()=>{'+script+'})()')(),/native screenshot dimensions missing/);
+  assert.equal(inputs,0);
+}
+"#;
+        let source = fixture.replace("SCRIPT", &serde_json::to_string(&script).unwrap());
+        let output = std::process::Command::new("node")
+            .args(["--input-type=module", "-e", &source])
+            .output()
+            .expect("the native provider's Node runtime must execute the geometry fixture");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
@@ -5439,10 +5509,10 @@ mod tests {
         assert!(prompt.contains("drag"));
         assert!(!prompt.contains("readiness-nonce"));
         assert_eq!(prompt.matches("sky.list_windows()").count(), 1);
-        assert!(prompt.contains("sky.click({window:s.window,x:190,y:142"));
-        assert!(
-            prompt.contains("sky.drag({window:s.window,from_x:230,from_y:325,to_x:660,to_y:430")
-        );
+        assert!(prompt.contains("sky.click({window:s.window,x:X(190),y:Y(142)"));
+        assert!(prompt.contains(
+            "sky.drag({window:s.window,from_x:X(230),from_y:Y(325),to_x:X(660),to_y:Y(430)"
+        ));
         assert!(prompt.contains("screenshotId:s.screenshots[0].id"));
         assert!(!prompt.contains("accessibility.tree"));
         assert!(!prompt.contains("setTimeout"));
