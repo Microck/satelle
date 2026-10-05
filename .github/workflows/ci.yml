@@ -64,8 +64,9 @@ jobs:
   rust:
     name: Rust quality gates (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    # Windows release builds of the workspace exceed 20 minutes on a cold cache.
-    timeout-minutes: 40
+    # Cold Windows compilation plus all suites and the static-CRT release
+    # can exceed 40 minutes. Keep every test and subprocess deadline intact.
+    timeout-minutes: ${{ matrix.os == 'windows-2025' && 90 || 40 }}
     strategy:
       fail-fast: false
       matrix:

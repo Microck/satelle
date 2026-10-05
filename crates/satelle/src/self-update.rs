@@ -3023,10 +3023,11 @@ mod tests {
             ),
             Err(ManagerProbeError::Timeout)
         );
+        // Byte-limit fixtures should not depend on starting the PowerShell CLR.
         assert_eq!(
             manager_command_line_bounded(
-                "powershell",
-                &["-NoProfile", "-Command", "[Console]::Write('12345678')"],
+                "cmd",
+                &["/D", "/C", "set /p satelle_probe=12345678<nul&exit /b 0"],
                 Duration::from_secs(1),
                 8,
             ),
@@ -3034,8 +3035,8 @@ mod tests {
         );
         assert_eq!(
             manager_command_line_bounded(
-                "powershell",
-                &["-NoProfile", "-Command", "[Console]::Write('123456789')"],
+                "cmd",
+                &["/D", "/C", "set /p satelle_probe=123456789<nul&exit /b 0"],
                 Duration::from_secs(1),
                 8,
             ),
