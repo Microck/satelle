@@ -2355,6 +2355,7 @@
 - Windows durable bootstrap failures retain only a closed set of launch-stage names from diagnostic stderr; raw remote diagnostics and credentials are never reproduced @spec @mvp @implemented
 - Windows durable SSH bootstrap transfers its token through the existing private pipe, commits desktop task ownership after the daemon ready frame within the resolved native-plus-provider readiness budget, and survives the SSH launcher exiting; foreground bootstrap still stops its child when the controller disconnects @spec @mvp
 - an interrupted Windows daemon-start claim can recover only when stale exact evidence and two process snapshots prove that its fenced wrapper, scheduled bootstrap tasks, and daemon launchers are absent, together with the daemon, service, and listener; unknown process metadata keeps the claim fenced, and recovery preserves the original claim and mailbox in an archive without fabricating a terminal result @spec @mvp @implemented
+- POSIX bootstrap recovery detects Host commands from full process arguments and macOS probes the canonical dev.microck.satelle.host launchd service before and after quarantining a claim; an absent historical label is not evidence that the current service is inactive @spec @mvp @implemented
 - satelle supports direct transport for hosts where SSH bootstrap is unavailable but a Host Daemon is already installed and reachable @spec @mvp @implemented
 
 # research

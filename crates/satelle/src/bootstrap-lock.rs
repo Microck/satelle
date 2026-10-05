@@ -1069,8 +1069,8 @@ for competitor in "$lock_root"/*; do
     fi
   fi
   process_probe=null
-  if process_output="$(ps -eo pid=,comm=,args= 2>/dev/null)"; then
-    if printf '%s\n' "$process_output" | awk -v self="$$" -v parent="$PPID" '$1 != self && $1 != parent && ($2 == "satelle" || $2 == "satelle.exe") && $0 ~ /host start/ {{ found=1 }} END {{ exit !found }}'; then
+  if process_output="$(ps -ww -eo pid=,args= 2>/dev/null)"; then
+    if printf '%s\n' "$process_output" | awk -v self="$$" -v parent="$PPID" '$1 != self && $1 != parent && $0 ~ /(^|[[:space:]\/])satelle(\.exe)?[[:space:]]+host[[:space:]]+start([[:space:]]|$)/ {{ found=1 }} END {{ exit !found }}'; then
       process_probe=true
     else
       probe_status=$?
@@ -1090,7 +1090,7 @@ for competitor in "$lock_root"/*; do
       case "$probe_status" in 3|4) service_probe=false;; esac
     fi
   elif command -v launchctl >/dev/null 2>&1; then
-    if launchctl print "gui/$(id -u)/satelle-host" >/dev/null 2>&1; then
+    if launchctl print "gui/$(id -u)/dev.microck.satelle.host" >/dev/null 2>&1; then
       service_probe=true
     else
       probe_status=$?
@@ -1254,8 +1254,8 @@ for competitor in "$lock_root"/*; do
   fi
   if [ "$failed_daemon_start" = true ] || [ "$released_state_owner" = true ]; then
     post_process_probe=null
-    if process_output="$(ps -eo pid=,comm=,args= 2>/dev/null)"; then
-      if printf '%s\n' "$process_output" | awk -v self="$$" -v parent="$PPID" '$1 != self && $1 != parent && ($2 == "satelle" || $2 == "satelle.exe") && $0 ~ /host start/ {{ found=1 }} END {{ exit !found }}'; then
+    if process_output="$(ps -ww -eo pid=,args= 2>/dev/null)"; then
+      if printf '%s\n' "$process_output" | awk -v self="$$" -v parent="$PPID" '$1 != self && $1 != parent && $0 ~ /(^|[[:space:]\/])satelle(\.exe)?[[:space:]]+host[[:space:]]+start([[:space:]]|$)/ {{ found=1 }} END {{ exit !found }}'; then
         post_process_probe=true
       else
         probe_status=$?
@@ -1269,7 +1269,7 @@ for competitor in "$lock_root"/*; do
         case "$probe_status" in 3|4) post_service_probe=false;; esac
       fi
     elif command -v launchctl >/dev/null 2>&1; then
-      if launchctl print "gui/$(id -u)/satelle-host" >/dev/null 2>&1; then post_service_probe=true; else
+      if launchctl print "gui/$(id -u)/dev.microck.satelle.host" >/dev/null 2>&1; then post_service_probe=true; else
         probe_status=$?
         [ "$probe_status" -eq 113 ] && post_service_probe=false
       fi
@@ -1523,7 +1523,7 @@ mod tests {
             "acquired_at",
             "heartbeat_at",
             HEARTBEAT,
-            "ps -eo pid=,comm=,args=",
+            "ps -ww -eo pid=,args=",
             "binary_present",
             "systemctl --user is-active",
             "launchctl print",
@@ -2634,6 +2634,35 @@ foreach ($body in @('satelle.exe host status', 'Write-Output unrelated')) {{
             );
             assert_eq!(contender.read_line(), BUSY);
             assert_eq!(contender.close().code(), Some(75));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn running_host_paths_keep_interrupted_release_fenced() {
+        let attempt = "0123456789abcdef0123456789abcdef";
+        for command in [
+            "satelle host start --foreground",
+            "/Users/microck/Library/Caches/Satelle/host/v0.1.32/darwin-arm64/satelle host start --foreground --launchd-service",
+            "/home/user with spaces/.cache/satelle host start --foreground",
+        ] {
+            let home = tempfile::tempdir().expect("temporary process probe home");
+            let lock = home.path().join("satelle/bootstrap.lock");
+            let claim = write_stale_mutation_claim(&lock, "state_owner_release", attempt);
+            fs::create_dir(claim.join(format!("execution_started.{attempt}"))).unwrap();
+            let path = path_with_inactive_daemon_probe(home.path());
+            fs::write(
+                home.path().join("probe-bin/ps"),
+                format!("#!/bin/sh\nprintf '%s\\n' '999999 {command}'\n"),
+            )
+            .unwrap();
+            let replacement =
+                Request::new("operation-2", OperationKind::MissingDaemonRepair, None).unwrap();
+            let mut contender =
+                RunningProtocol::start_with_path(&replacement, home.path(), Some(&path));
+            assert_eq!(contender.read_line(), BUSY, "{command}");
+            assert_eq!(contender.close().code(), Some(75));
+            assert!(claim.join(format!("execution_started.{attempt}")).is_dir());
         }
     }
 
