@@ -241,9 +241,9 @@ function Fail-Busy {{
   Write-Protocol '{BUSY}'
   exit 75
 }}
-function Record-Recovery([string]$Observed, [string]$Reason, [object]$Process, [bool]$Binary, [object]$Service, [object]$Daemon) {{
+function Record-Recovery([string]$Observed, [string]$Reason, [object]$Process, [bool]$Binary, [object]$Service, [object]$Daemon, [object]$Launcher) {{
   $record = Join-Path $stateRoot ('bootstrap-recovery-' + $Observed + '.json')
-  @{{schema_version='satelle.bootstrap-recovery.v1';operation_id=$Observed;reason=$Reason;process_probe=$Process;binary_probe=$Binary;service_probe=$Service;daemon_probe=$Daemon;observed_at=[DateTimeOffset]::UtcNow.ToString('O')}} |
+  @{{schema_version='satelle.bootstrap-recovery.v1';operation_id=$Observed;reason=$Reason;process_probe=$Process;binary_probe=$Binary;service_probe=$Service;daemon_probe=$Daemon;launcher_probe=$Launcher;observed_at=[DateTimeOffset]::UtcNow.ToString('O')}} |
     ConvertTo-Json -Compress | Set-Content -LiteralPath $record -Encoding UTF8
 }}
 function Get-DaemonListenerProbe {{
@@ -255,6 +255,45 @@ function Get-DaemonListenerProbe {{
   }} catch {{
     return $null
   }}
+}}
+function Get-DaemonProcessProbe {{
+  try {{
+    foreach ($candidate in @(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object {{
+      $_.Name -match '^satelle\.exe$'
+    }})) {{
+      if ([String]::IsNullOrWhiteSpace($candidate.CommandLine)) {{ return $null }}
+      if ($candidate.CommandLine -match 'host start') {{ return $true }}
+    }}
+    return $false
+  }} catch {{ return $null }}
+}}
+function Get-DaemonStartLauncherStatus([object]$Candidate, [string]$Operation) {{
+  $line = $Candidate.CommandLine
+  if ([String]::IsNullOrWhiteSpace($line) -or $line.Length -gt 32768) {{ return $null }}
+  try {{
+    $script = $line
+    if ($line -match '(?i)-EncodedCommand\s+([A-Za-z0-9+/]+={{0,2}})(?=\s|$)') {{
+      $decoder = New-Object Text.UnicodeEncoding($false, $false, $true)
+      $script = $decoder.GetString([Convert]::FromBase64String($Matches[1]))
+    }} elseif ($line -match '(?i)-EncodedCommand') {{ return $null }}
+    # The fenced wrapper carries the operation; the detached inner launcher
+    # carries the native helper or Satelle host-start command. Check both.
+    return ($script.Contains($Operation) -or $script.Contains('SatelleBootstrapNative') -or
+      ($script -match '(?i)(interactive-bootstrap-(parent|child)|local-daemon-parent)\.ps1') -or
+      ($script -match '(?i)SatelleLocalDaemon-[a-f0-9]{{32}}') -or
+      (($script -match '(?i)satelle') -and ($script -match '(?i)host start')))
+  }} catch {{ return $null }}
+}}
+function Get-DaemonStartLauncherProbe([string]$Operation) {{
+  try {{
+    foreach ($candidate in @(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object {{
+      $_.Name -match '^(powershell|pwsh)\.exe$' -and $_.ProcessId -ne $PID
+    }})) {{
+      $active = Get-DaemonStartLauncherStatus $candidate $Operation
+      if ($active -ne $false) {{ return $active }}
+    }}
+    return $false
+  }} catch {{ return $null }}
 }}
 function Get-ExecutionMarkers([string]$Root) {{
   @(Get-ChildItem -LiteralPath $Root -Force -ErrorAction Stop | Where-Object {{
@@ -454,10 +493,7 @@ foreach ($item in @(Get-ChildItem -LiteralPath $lockRoot -Force -ErrorAction Sto
   }} catch {{ Fail-Busy }}
   if (([DateTimeOffset]::UtcNow - $heartbeatTime).TotalSeconds -le {STALE_AFTER_SECONDS}) {{ Fail-Busy }}
   if ($claimState -cnotin @('live', 'mutation_started', 'recovery_pending')) {{ Fail-Busy }}
-  $processProbe = $null
-  try {{
-    $processProbe = [bool](Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object {{ $_.Name -match '^satelle\.exe$' -and $_.CommandLine -match 'host start' }} | Select-Object -First 1)
-  }} catch {{}}
+  $processProbe = Get-DaemonProcessProbe
   $processActive = $processProbe -eq $true
   $binaryPresent = [bool](Get-ChildItem -LiteralPath $cacheRoot -File -Recurse -ErrorAction SilentlyContinue | Where-Object {{ $_.Name -match '^satelle\.exe$' }} | Select-Object -First 1)
   $serviceProbe = $null
@@ -467,15 +503,25 @@ foreach ($item in @(Get-ChildItem -LiteralPath $lockRoot -Force -ErrorAction Sto
   $serviceActive = $serviceProbe -eq $true
   $daemonProbe = Get-DaemonListenerProbe
   $daemonActive = $daemonProbe -eq $true
-  Record-Recovery $observed 'stale heartbeat postcondition probes' $processProbe $binaryPresent $serviceProbe $daemonProbe
+  Record-Recovery $observed 'stale heartbeat postcondition probes' $processProbe $binaryPresent $serviceProbe $daemonProbe $null
   $terminalEvidence = ($requiresCommit -and $executionCommitted) -or
     ((-not $requiresCommit) -and $executionSucceeded)
+  $launcherProbe = $null
+  $daemonStartAttempt = ($mutationPhase -ceq 'daemon_start') -and $executionStarted -and
+    (-not $executionRetiring) -and (-not $executionCommitted)
+  $startedOnlyDaemon = $daemonStartAttempt -and (-not $executionSucceeded) -and (-not $executionFailed)
+  if ($daemonStartAttempt) {{
+    $launcherProbe = Get-DaemonStartLauncherProbe $observed
+    Record-Recovery $observed 'stale daemon-start launcher probe' $processProbe $binaryPresent $serviceProbe $daemonProbe $launcherProbe
+  }}
   $failedDaemonStart = ($claimState -cin @('mutation_started', 'recovery_pending')) -and
     ($claimOperationKind -cin @('initial_setup', 'missing_daemon_repair')) -and
     ($mutationPhase -ceq 'daemon_start') -and
-    $executionStarted -and ($executionSucceeded -xor $executionFailed) -and
+    $executionStarted -and (($executionSucceeded -xor $executionFailed) -or
+      ($startedOnlyDaemon -and ($launcherProbe -eq $false))) -and
     (-not $executionCommitted) -and (-not $unexpectedExecutionEvidence) -and
-    ($processProbe -eq $false) -and ($serviceProbe -eq $false) -and ($daemonProbe -eq $false)
+    ($processProbe -eq $false) -and ($serviceProbe -eq $false) -and ($daemonProbe -eq $false) -and
+    ($launcherProbe -eq $false)
   $releasedStateOwner = ($claimState -cin @('mutation_started', 'recovery_pending')) -and
     ($mutationPhase -ceq 'state_owner_release') -and $executionStarted -and
     (-not $executionRetiring) -and (-not $executionSucceeded) -and
@@ -574,16 +620,25 @@ foreach ($item in @(Get-ChildItem -LiteralPath $lockRoot -Force -ErrorAction Sto
     Fail-Busy
   }}
   if ($failedDaemonStart -or $releasedStateOwner) {{
-    $postProcessProbe = $null
-    try {{
-      $postProcessProbe = [bool](Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object {{ $_.Name -match '^satelle\.exe$' -and $_.CommandLine -match 'host start' }} | Select-Object -First 1)
-    }} catch {{}}
+    $postProcessProbe = Get-DaemonProcessProbe
     $postServiceProbe = $null
     try {{
       $postServiceProbe = [bool](Get-CimInstance Win32_Service -Filter "Name = 'SatelleHost'" -ErrorAction Stop | Where-Object {{ $_.State -ne 'Stopped' }} | Select-Object -First 1)
     }} catch {{}}
     $postDaemonProbe = Get-DaemonListenerProbe
-    if (($postProcessProbe -ne $false) -or ($postServiceProbe -ne $false) -or ($postDaemonProbe -ne $false)) {{
+    $postLauncherProbe = if ($daemonStartAttempt) {{ Get-DaemonStartLauncherProbe $observed }} else {{ $false }}
+    Record-Recovery $observed 'quarantined daemon-start postcondition probes' $postProcessProbe $binaryPresent $postServiceProbe $postDaemonProbe $postLauncherProbe
+    if (($postProcessProbe -ne $false) -or ($postServiceProbe -ne $false) -or
+        ($postDaemonProbe -ne $false) -or ($postLauncherProbe -ne $false)) {{
+      Restore-Competitor $item.FullName $quarantineRoot $quarantinedClaim
+      Fail-Busy
+    }}
+  }}
+  if ($failedDaemonStart) {{
+    # Absence resolves the outstanding start, not its historical result. Keep
+    # the original markers and mailbox rather than manufacture a terminal one.
+    $archivePath = Join-Path $stateRoot ('bootstrap-recovered.' + $observed + '.' + $observedIdentity)
+    try {{ [IO.Directory]::Move($quarantinedClaim, $archivePath) }} catch {{
       Restore-Competitor $item.FullName $quarantineRoot $quarantinedClaim
       Fail-Busy
     }}
@@ -1678,7 +1733,7 @@ foreach ($mode in @([IO.FileMode]::CreateNew, [IO.FileMode]::Create)) {{
         assert!(script.contains("($mutationPhase -ceq 'daemon_start') -and"));
         assert!(
             script.contains(
-                "$executionStarted -and ($executionSucceeded -xor $executionFailed) -and"
+                "$executionStarted -and (($executionSucceeded -xor $executionFailed) -or\n      ($startedOnlyDaemon -and ($launcherProbe -eq $false))) -and"
             )
         );
         assert!(
@@ -1691,10 +1746,62 @@ foreach ($mode in @([IO.FileMode]::CreateNew, [IO.FileMode]::Create)) {{
         ));
         assert!(script.contains("if ($failedDaemonStart -or $releasedStateOwner)"));
         assert!(script.contains("$postProcessProbe -ne $false"));
+        assert!(script.contains("$postLauncherProbe -ne $false"));
+        assert_eq!(
+            script
+                .matches("Get-DaemonStartLauncherProbe $observed")
+                .count(),
+            2
+        );
+        assert!(script.contains("[IO.Directory]::Move($quarantinedClaim, $archivePath)"));
+        assert!(script.contains("launcher_probe=$Launcher"));
         assert!(
             script.contains("Restore-Competitor $item.FullName $quarantineRoot $quarantinedClaim")
         );
         assert!(script.contains("$terminalEvidence -or $failedDaemonStart"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_launcher_status_keeps_unknown_metadata_fenced() {
+        let script = request().windows_script();
+        let classifier = script
+            .split_once("function Get-DaemonStartLauncherStatus")
+            .unwrap()
+            .1
+            .split_once("function Get-DaemonStartLauncherProbe")
+            .unwrap()
+            .0;
+        let script = format!(
+            r#"$ErrorActionPreference = 'Stop'
+function Get-DaemonStartLauncherStatus{classifier}
+$operation = '00000000-0000-7000-8000-000000000001'
+foreach ($line in @($null, '', 'powershell.exe -EncodedCommand !!!', 'powershell.exe -EncodedCommand AA==', ('x' * 32769))) {{
+  $status = Get-DaemonStartLauncherStatus ([pscustomobject]@{{CommandLine=$line}}) $operation
+  if ($null -ne $status) {{ throw 'unknown metadata was classified as inactive' }}
+}}
+foreach ($body in @($operation, 'SatelleBootstrapNative', 'satelle.exe host start', 'powershell.exe -File C:\Temp\interactive-bootstrap-child.ps1', 'powershell.exe -File C:\Temp\local-daemon-parent.ps1', 'SatelleLocalDaemon-0123456789abcdef0123456789abcdef')) {{
+  $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($body))
+  $status = Get-DaemonStartLauncherStatus ([pscustomobject]@{{CommandLine=('powershell.exe -EncodedCommand ' + $encoded)}}) $operation
+  if ($status -ne $true) {{ throw 'active launcher was not recognized' }}
+}}
+foreach ($body in @('satelle.exe host status', 'Write-Output unrelated')) {{
+  $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($body))
+  $status = Get-DaemonStartLauncherStatus ([pscustomobject]@{{CommandLine=('powershell.exe -EncodedCommand ' + $encoded)}}) $operation
+  if ($status -ne $false) {{ throw 'unrelated process was classified as a launcher' }}
+}}
+"#,
+        );
+        let output = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command"])
+            .arg(script)
+            .output()
+            .expect("run production launcher classification with process metadata fixtures");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
