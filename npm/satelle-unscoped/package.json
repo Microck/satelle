@@ -1,6 +1,6 @@
 {
   "name": "satelle",
-  "version": "0.1.30",
+  "version": "0.1.31",
   "description": "Unscoped convenience package for the Satelle native CLI.",
   "license": "MIT",
   "repository": {
@@ -18,7 +18,7 @@
     "bin/satelle.cjs"
   ],
   "dependencies": {
-    "@microck/satelle": "0.1.30"
+    "@microck/satelle": "0.1.31"
   },
   "publishConfig": {
     "access": "public",
