@@ -2349,6 +2349,9 @@
 - uploaded Host Daemon binaries are verified against release integrity metadata before remote execution @spec @mvp @implemented
 - uploaded binaries are staged under generated names and atomically promoted only after verification @spec @mvp @implemented
 - remote bootstrap stdout used as a machine protocol is size-bounded and separated from diagnostic stderr @spec @mvp @implemented
+- Windows file-backed mutation retains the launcher process handle and exit code while waiting only for that launcher, not a detached daemon descendant, and durable daemon starts use the signed-in desktop launcher @spec @mvp @implemented
+- Windows durable daemon launch opens the NUL device through CreateFileW, keeps its native handle alive through child creation, and restores parent handles before returning @spec @mvp @implemented
+- Windows durable bootstrap failures retain only a closed set of launch-stage names from diagnostic stderr; raw remote diagnostics and credentials are never reproduced @spec @mvp @implemented
 - satelle supports direct transport for hosts where SSH bootstrap is unavailable but a Host Daemon is already installed and reachable @spec @mvp @implemented
 
 # research
