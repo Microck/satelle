@@ -797,6 +797,79 @@ fn host_default_cache_lookup_requires_one_desktop_without_blocking_startup() {
 }
 
 #[test]
+fn host_default_cache_lookup_authenticates_only_live_success_candidates() {
+    for condition in [
+        "empty",
+        "expired",
+        "future",
+        "failed",
+        "mismatch",
+        "matching",
+        "invalidated",
+    ] {
+        let state = crate::host::TestStateDir::new().unwrap();
+        let adapter = ProviderProbeRecoveryAdapter::new([]);
+        let runtime = RuntimeHandle::new(Ok(state.path().to_path_buf()), adapter.clone());
+        let engine = runtime.engine().unwrap();
+        if condition != "empty" {
+            let key = ProviderProbeRecoveryAdapter::key();
+            let now = time::OffsetDateTime::now_utc();
+            let observed_at = match condition {
+                "expired" => now - time::Duration::minutes(10),
+                "future" => now + time::Duration::minutes(10),
+                _ => now,
+            };
+            let evidence = key
+                .evidence(
+                    "capabilities-candidate",
+                    observed_at,
+                    observed_at + time::Duration::minutes(5),
+                )
+                .unwrap();
+            let mut storage = engine.lock_storage().unwrap();
+            storage
+                .store_preflight_successes(
+                    key.adapter(),
+                    key.desktop_binding(),
+                    key.execution_policy(),
+                    &evidence,
+                    None,
+                )
+                .unwrap();
+            let change = match condition {
+                "failed" => Some(
+                    "UPDATE native_readiness_results SET status = 'failed', failure_reason = 'native_action_failed'",
+                ),
+                "mismatch" => Some(
+                    "UPDATE native_readiness_results SET native_runtime_version = 'changed-runtime'",
+                ),
+                _ => None,
+            };
+            if let Some(sql) = change {
+                storage.connection_for_test().execute(sql, []).unwrap();
+            }
+            if condition == "invalidated" {
+                storage.invalidate_all_native_readiness().unwrap();
+            }
+        }
+
+        assert_eq!(
+            runtime.has_reusable_readiness(LOCAL_DEMO_HOST).unwrap(),
+            condition == "matching",
+            "{condition}"
+        );
+        assert_eq!(
+            adapter.readiness_key_calls.load(Ordering::SeqCst),
+            usize::from(matches!(condition, "matching" | "mismatch")),
+            "{condition}"
+        );
+        assert_eq!(adapter.native_probe_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(adapter.provider_probe_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(runtime.snapshot().unwrap().session_count(), 0);
+    }
+}
+
+#[test]
 fn host_default_cache_lookup_treats_provider_opt_in_as_unavailable() {
     let state = crate::host::TestStateDir::new().expect("temporary state directory should exist");
     let error = SatelleError {
@@ -810,6 +883,22 @@ fn host_default_cache_lookup_treats_provider_opt_in_as_unavailable() {
         Ok(state.path().to_path_buf()),
         BlockedComputerUseAdapter::new(error),
     );
+    // Exercise the adapter error path, rather than the empty-store shortcut.
+    let key = ProviderProbeRecoveryAdapter::key();
+    let evidence = ProviderProbeRecoveryAdapter::new([]).readiness();
+    runtime
+        .engine()
+        .unwrap()
+        .lock_storage()
+        .unwrap()
+        .store_preflight_successes(
+            key.adapter(),
+            key.desktop_binding(),
+            key.execution_policy(),
+            &evidence,
+            None,
+        )
+        .unwrap();
 
     assert!(
         !runtime
@@ -2724,6 +2813,7 @@ struct TerminalRecoveryAdapter {
 
 #[derive(Clone)]
 struct ProviderProbeRecoveryAdapter {
+    readiness_key_calls: Arc<AtomicUsize>,
     observations: Arc<Mutex<VecDeque<RecoveryObservation>>>,
     observation_calls: Arc<AtomicUsize>,
     native_results: Arc<Mutex<VecDeque<NativeProbeBehavior>>>,
@@ -2751,6 +2841,7 @@ enum NativeProbeBehavior {
 impl ProviderProbeRecoveryAdapter {
     fn new(observations: impl IntoIterator<Item = RecoveryObservation>) -> Self {
         Self {
+            readiness_key_calls: Arc::new(AtomicUsize::new(0)),
             observations: Arc::new(Mutex::new(observations.into_iter().collect())),
             observation_calls: Arc::new(AtomicUsize::new(0)),
             native_results: Arc::new(Mutex::new(VecDeque::new())),
@@ -2923,6 +3014,7 @@ impl ComputerUseAdapter for ProviderProbeRecoveryAdapter {
         _host: &str,
         provider_intent: &ProviderComputerUseIntent,
     ) -> Result<Option<ReadinessCacheKey>, SatelleError> {
+        self.readiness_key_calls.fetch_add(1, Ordering::SeqCst);
         if self.require_resolved_explicit_binding
             && provider_intent.model().is_some()
             && provider_intent.provider().is_some()
