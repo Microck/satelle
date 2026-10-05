@@ -1,3 +1,9 @@
+## satelle@0.1.34
+
+### Host readiness status
+
+Keep Host capabilities responsive after setup invalidates native readiness evidence. Skip native runtime authentication when there is no live successful cache candidate, and require the full current authenticated identity before reusing a candidate.
+
 ## satelle@0.1.33
 
 ### Host startup and recovery

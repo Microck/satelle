@@ -1,6 +1,6 @@
 core:changelogs:
-  - content: "---\npackages:\n  cargo:satelle:\n    type: patch\n---\n\n## Host startup and recovery\n\nKeep detached Windows desktop Hosts alive after the bootstrap SSH connection closes. Preserve hidden helpers and stop unconfirmed handoff tasks.\n\nOpen native Windows null handles correctly and report redirected PowerShell failures with their real exit codes.\n\nRecover interrupted inactive Windows Host starts and POSIX service restarts after checking the daemon, service, listener and old launcher twice. Preserve the original claim, execution markers and diagnostic mailbox without treating an unknown restart as successful.\n\nDetect the canonical Mac launchd service and full Host executable paths during recovery.\n\n## Unix installation\n\nReap download and polling children before releasing an interrupted install lock, including termination during child PID capture.\n"
-    filename: host-recovery.md
+  - content: "---\npackages:\n  cargo:satelle:\n    type: patch\n---\n\n## Host readiness status\n\nKeep Host capabilities responsive after setup invalidates native readiness evidence. Skip native runtime authentication when there is no live successful cache candidate, and require the full current authenticated identity before reusing a candidate.\n"
+    filename: readiness-status.md
     v: 0.0.0
 core:packages:
   - id: npm:satelle-repository
@@ -8,7 +8,7 @@ core:packages:
   - id: npm:satelle-docs
     updated: false
   - changelogIds:
-      - host-recovery.md
+      - readiness-status.md
     id: cargo:satelle
     updated: true
 npm:packages:
