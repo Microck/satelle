@@ -7174,9 +7174,9 @@ impl SatelleError {
     pub fn host_busy_operation(host: &str, active_operation_id: &str) -> Self {
         Self {
             code: ErrorCode::HostBusy,
-            message: format!("Host `{host}` is already controlling its authorized desktop"),
+            message: format!("Host `{host}` is reserved by operation `{active_operation_id}`"),
             recovery_command: Some(format!(
-                "wait for operation `{active_operation_id}` to finish, then retry"
+                "wait for operation `{active_operation_id}` to finish or reconcile its pending recovery, then retry"
             )),
             source_detail: None,
             details: BTreeMap::from([

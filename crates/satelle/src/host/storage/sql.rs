@@ -1030,10 +1030,6 @@ impl Storage {
 
 impl From<LifecycleError> for StorageError {
     fn from(source: LifecycleError) -> Self {
-        Self {
-            kind: StorageErrorKind::StateConflict,
-            conflicting_session_id: None,
-            source: Some(Box::new(source)),
-        }
+        Self::with_source(StorageErrorKind::StateConflict, source)
     }
 }

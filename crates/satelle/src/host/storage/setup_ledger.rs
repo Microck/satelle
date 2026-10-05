@@ -1859,30 +1859,33 @@ fn begin_setup_run_in_transaction(
     if host_update_artifact_identity_required != plan.host_update_recovery_identity.is_some() {
         return Err(StorageError::new(StorageErrorKind::InvalidInput));
     }
-    let maintenance_exists: i64 = transaction
+    let maintenance_owner: Option<String> = transaction
         .query_row(
-            "SELECT EXISTS(SELECT 1 FROM maintenance_leases WHERE host_identity_ref = ?1)",
+            "SELECT operation_id FROM maintenance_leases WHERE host_identity_ref = ?1",
             [host_identity],
             |row| row.get(0),
         )
+        .optional()
         .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
-    if maintenance_exists != 0 {
-        return Err(StorageError::new(StorageErrorKind::LeaseConflict));
+    if let Some(operation_id) = maintenance_owner {
+        return Err(StorageError::lease_conflict_operation(operation_id));
     }
     // Planning and execution are separate API calls. Reserving mutation scope
     // here closes the race between callers that planned before either wrote.
     if active_setup_run_in_scope(transaction, plan.desktop_binding.as_ref())? {
         return Err(StorageError::new(StorageErrorKind::StateConflict));
     }
-    let control_exists: i64 = transaction
+    let control_owner: Option<String> = transaction
         .query_row(
-            "SELECT EXISTS(SELECT 1 FROM control_leases WHERE host_identity_ref = ?1)",
+            "SELECT operation_id FROM control_leases WHERE host_identity_ref = ?1
+             ORDER BY operation_id LIMIT 1",
             [host_identity],
             |row| row.get(0),
         )
+        .optional()
         .map_err(|source| sqlite_error(StorageErrorKind::OperationFailed, source))?;
-    if control_exists != 0 {
-        return Err(StorageError::new(StorageErrorKind::LeaseConflict));
+    if let Some(operation_id) = control_owner {
+        return Err(StorageError::lease_conflict_operation(operation_id));
     }
     transaction
         .execute(

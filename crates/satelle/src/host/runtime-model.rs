@@ -257,12 +257,16 @@ pub(super) fn storage_failure_ref(error: &StorageError) -> SatelleError {
     if let Some(session_id) = error.conflicting_session_id() {
         return SatelleError::host_busy(LOCAL_DEMO_HOST, session_id);
     }
+    if let Some(operation_id) = error.conflicting_operation_id() {
+        return SatelleError::host_busy_operation(LOCAL_DEMO_HOST, operation_id);
+    }
     match error.kind() {
         StorageErrorKind::InvalidInput => SatelleError::invalid_usage(error.to_string()),
         StorageErrorKind::IdempotencyConflict => idempotency_conflict(),
         StorageErrorKind::AdmissionCancelled => SatelleError::interrupted_attached_command(),
         StorageErrorKind::Busy => SatelleError::storage_busy(),
         StorageErrorKind::StoreInUse => SatelleError::store_in_use(),
+        StorageErrorKind::LeaseConflict => SatelleError::host_busy_without_owner(LOCAL_DEMO_HOST),
         StorageErrorKind::StateConflict => SatelleError::state_conflict(),
         StorageErrorKind::SessionNotSteerable => SatelleError::computer_use_not_ready(),
         StorageErrorKind::UnsafeStatePath
@@ -334,6 +338,16 @@ fn public_time(value: OffsetDateTime) -> Result<String, SatelleError> {
 #[cfg(test)]
 mod storage_failure_tests {
     use super::*;
+
+    #[test]
+    fn control_lease_conflict_is_busy_without_inventing_an_owner() {
+        let error = storage_failure(StorageError::for_test(StorageErrorKind::LeaseConflict));
+
+        assert_eq!(error.code, ErrorCode::HostBusy);
+        assert_eq!(error.exit_code(), 75);
+        assert!(!error.details.contains_key("active_session_id"));
+        assert!(!error.details.contains_key("active_operation_id"));
+    }
 
     #[test]
     fn sqlite_busy_is_preserved_as_a_typed_transient_error() {
