@@ -1272,6 +1272,10 @@ fn maintenance_lease_conflicts_with_control_and_blocks_other_admission() {
         )
         .expect_err("a second maintenance operation must be blocked");
     assert_eq!(StorageErrorKind::LeaseConflict, competing.kind());
+    assert_eq!(
+        competing.conflicting_operation_id(),
+        Some("maintenance-operation")
+    );
 
     let blocked_session = initial_session(&storage, SESSION_2, TURN_2, at(5));
     let blocked_turn = storage
@@ -1286,6 +1290,97 @@ fn maintenance_lease_conflicts_with_control_and_blocks_other_admission() {
         )
         .expect_err("maintenance must block Turn admission");
     assert_eq!(StorageErrorKind::LeaseConflict, blocked_turn.kind());
+}
+
+#[test]
+fn bootstrap_maintenance_conflict_preserves_native_probe_owner() {
+    for restart in [false, true] {
+        let state = TempDir::new().expect("temporary state directory");
+        let (mut storage, _) = Storage::open(state.path()).expect("open storage");
+        storage
+            .begin_native_probe(
+                &readiness_key("native-probe-desktop"),
+                "blocking-native-probe",
+                &lease_owner("blocking-native-probe", at(1)),
+            )
+            .expect("acquire native probe Control Lease");
+        if restart {
+            drop(storage);
+            (storage, _) = Storage::open(state.path()).expect("classify orphaned probe");
+        }
+        let owner_before: (String, String, String) = storage
+            .connection_for_test()
+            .query_row(
+                "SELECT operation_id, owner_kind, lease_state FROM control_leases",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(owner_before.1, "native_probe");
+        assert_eq!(
+            owner_before.2,
+            if restart {
+                "recovery_pending"
+            } else {
+                "active"
+            }
+        );
+        let plan = SetupRunPlan::new(
+            "conflicting-bootstrap",
+            SetupOperationKind::Setup,
+            None,
+            at(2),
+            vec![SetupActionPlan::new("bootstrap-handoff", "Bootstrap handoff", true).unwrap()],
+        )
+        .unwrap();
+        let changes_before = storage.connection_for_test().total_changes();
+        let error = storage
+            .begin_bootstrap_maintenance(&plan, lease_owner(plan.run_id(), at(2)))
+            .expect_err("maintenance cannot displace a native probe");
+        assert_eq!(StorageErrorKind::LeaseConflict, error.kind());
+        assert_eq!(
+            error.conflicting_operation_id(),
+            Some("blocking-native-probe")
+        );
+        assert!(error.conflicting_session_id().is_none());
+        let public_error = crate::host::runtime::storage_failure(error);
+        assert_eq!(public_error.code, crate::core::ErrorCode::HostBusy);
+        assert_eq!(public_error.exit_code(), 75);
+        assert_eq!(
+            public_error
+                .details
+                .get("active_operation_id")
+                .and_then(serde_json::Value::as_str),
+            Some("blocking-native-probe")
+        );
+        assert!(!public_error.details.contains_key("active_session_id"));
+        assert!(
+            public_error
+                .message
+                .contains("reserved by operation `blocking-native-probe`")
+        );
+        assert!(
+            public_error
+                .recovery_command
+                .as_deref()
+                .unwrap()
+                .contains("pending recovery")
+        );
+        assert_eq!(
+            storage.connection_for_test().total_changes(),
+            changes_before
+        );
+        assert!(storage.load_setup_run(plan.run_id()).unwrap().is_none());
+        let owner_after = storage
+            .connection_for_test()
+            .query_row(
+                "SELECT operation_id, owner_kind, lease_state FROM control_leases",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(owner_before, owner_after);
+    }
 }
 
 #[test]

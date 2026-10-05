@@ -908,9 +908,14 @@ impl fmt::Display for StorageErrorKind {
     }
 }
 
+enum LeaseConflictOwner {
+    Session(SessionId),
+    Operation(String),
+}
+
 pub(crate) struct StorageError {
     kind: StorageErrorKind,
-    conflicting_session_id: Option<SessionId>,
+    conflicting_owner: Option<LeaseConflictOwner>,
     source: Option<Box<dyn Error + Send + Sync>>,
 }
 
@@ -959,7 +964,7 @@ impl StorageError {
     fn new(kind: StorageErrorKind) -> Self {
         Self {
             kind,
-            conflicting_session_id: None,
+            conflicting_owner: None,
             source: None,
         }
     }
@@ -978,13 +983,31 @@ impl StorageError {
     }
 
     pub(crate) fn conflicting_session_id(&self) -> Option<&SessionId> {
-        self.conflicting_session_id.as_ref()
+        match self.conflicting_owner.as_ref() {
+            Some(LeaseConflictOwner::Session(session_id)) => Some(session_id),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn conflicting_operation_id(&self) -> Option<&str> {
+        match self.conflicting_owner.as_ref() {
+            Some(LeaseConflictOwner::Operation(operation_id)) => Some(operation_id),
+            _ => None,
+        }
     }
 
     fn lease_conflict(session_id: SessionId) -> Self {
         Self {
             kind: StorageErrorKind::LeaseConflict,
-            conflicting_session_id: Some(session_id),
+            conflicting_owner: Some(LeaseConflictOwner::Session(session_id)),
+            source: None,
+        }
+    }
+
+    fn lease_conflict_operation(operation_id: String) -> Self {
+        Self {
+            kind: StorageErrorKind::LeaseConflict,
+            conflicting_owner: Some(LeaseConflictOwner::Operation(operation_id)),
             source: None,
         }
     }
@@ -992,7 +1015,7 @@ impl StorageError {
     fn with_source(kind: StorageErrorKind, source: impl Error + Send + Sync + 'static) -> Self {
         Self {
             kind,
-            conflicting_session_id: None,
+            conflicting_owner: None,
             source: Some(Box::new(source)),
         }
     }
