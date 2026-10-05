@@ -59,6 +59,13 @@ pub(crate) fn recover(
     let attempt = value("mutation_attempt")?;
     let heartbeat =
         OffsetDateTime::parse(value("heartbeat_at")?, &Rfc3339).map_err(|_| conflict())?;
+    // The producer publishes an opaque directory nonce separately from the
+    // private claim identity. Bind the name to this operation, not that identity.
+    let claim_prefix = format!("claim.{operation_id}.");
+    let claim_nonce = claim_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix(&claim_prefix));
     if value("operation_id")? != operation_id
         || !matches!(
             value("operation_kind")?,
@@ -68,8 +75,9 @@ pub(crate) fn recover(
         || value("mutation_phase")? != "setup_maintenance_begin"
         || !hex_identity(identity)
         || !hex_identity(attempt)
-        || claim_path.file_name().and_then(|name| name.to_str())
-            != Some(format!("claim.{operation_id}.{identity}").as_str())
+        || claim_nonce.is_none_or(|nonce| {
+            nonce.is_empty() || !nonce.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        })
         || OffsetDateTime::now_utc() - heartbeat <= time::Duration::seconds(30)
     {
         return Err(conflict());
@@ -299,6 +307,22 @@ mod tests {
         );
         let storage = Storage::open_without_restart_recovery(&fixture.state).unwrap();
         assert!(storage.load_setup_run(OPERATION).unwrap().is_none());
+    }
+
+    #[test]
+    fn foreign_empty_or_retiring_claim_names_keep_the_claim_fenced() {
+        for basename in [
+            "claim.another-operation.fhgc9G",
+            "claim.interrupted-setup.",
+            "claim.interrupted-setup.fhgc9G.closing",
+        ] {
+            let mut fixture = Fixture::new();
+            let renamed = fixture.claim.with_file_name(basename);
+            fs::rename(&fixture.claim, &renamed).unwrap();
+            fixture.claim = renamed;
+            assert!(fixture.recover(true).is_err(), "{basename}");
+            assert!(fixture.claim.is_dir());
+        }
     }
 
     #[test]
