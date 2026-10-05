@@ -1439,7 +1439,8 @@ fn execute_request(indexed: &IndexedRequest, context: &AutomationContext) -> Bat
         }
     };
 
-    let mut child = context.machine_command();
+    let mut child = satelle::command_group::background_command(&context.executable);
+    child.args(context.machine_arguments());
     append_machine_command_arguments(&mut child, &request.arguments, OutputFormat::CompactJson);
     child.stdin(Stdio::null());
     match child.output() {

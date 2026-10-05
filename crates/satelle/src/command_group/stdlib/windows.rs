@@ -53,11 +53,12 @@ mod tests {
 
     #[test]
     fn background_group_has_no_console_and_preserves_output() {
-        let output = crate::command_group::builder::hidden_console_probe_command()
-            .group_spawn()
-            .expect("start hidden Windows child")
-            .wait_with_output()
-            .expect("collect hidden child output");
+        let output =
+            crate::command_group::builder::hidden_console_probe_command(std::process::Command::new)
+                .group_spawn()
+                .expect("start hidden Windows child")
+                .wait_with_output()
+                .expect("collect hidden child output");
         assert!(
             output.status.success(),
             "{}",

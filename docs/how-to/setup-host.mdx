@@ -158,8 +158,9 @@ Windows interactive Host and bootstrap tasks run at normal scheduling priority.
 Runtime identity checks still hash the installed binary before native execution;
 they do not inherit Task Scheduler's default background priority.
 
-Windows background bootstrap helpers and managed provider processes do not open
-terminal windows. The persistent task launches a hidden PowerShell owner that
+Windows background bootstrap helpers, SSH helpers, updater checks, telemetry
+delivery, batch commands and managed provider processes do not open terminal
+windows. The persistent task launches a hidden PowerShell owner that
 waits for its no-console Host Daemon and returns its exit status. Task Scheduler
 still tracks the daemon lifetime. CLI output and private diagnostics remain
 available; app-access and operating-system approval prompts remain visible.

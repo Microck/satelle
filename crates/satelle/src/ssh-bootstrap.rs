@@ -1,5 +1,6 @@
 use crate::self_update;
 use base64::Engine as _;
+use satelle::command_group::background_command;
 use satelle::core::session::HostIdentityRef;
 use satelle::core::{DaemonPathOverrides, HostConfig, SshIdentityCommitRecord};
 use satelle::host::{ApiBearerToken, readiness_probe_timeouts};
@@ -16,7 +17,9 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::io::{Seek, SeekFrom};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
+#[cfg(all(test, unix))]
+use std::process::Command;
+use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
@@ -523,7 +526,7 @@ impl SshBootstrapLock {
         let remote_command = windows_script
             .as_ref()
             .map_or(command.as_str(), |script| script.remote_command.as_str());
-        let mut child = Command::new(ssh_program)
+        let mut child = background_command(ssh_program)
             .arg("-T")
             .arg(destination)
             .arg(remote_command)
@@ -1132,7 +1135,7 @@ impl SshBootstrapProcess {
             .map_or(remote_command.as_str(), |script| {
                 script.remote_command.as_str()
             });
-        let mut command = Command::new("ssh");
+        let mut command = background_command("ssh");
         command.arg("-T");
         if windows {
             command.arg("-n");
@@ -3255,7 +3258,7 @@ fn run_windows_platform_probe_with_program(
     );
     let mut stdout = tempfile::tempfile().map_err(SshBootstrapError::LocalFile)?;
     let mut stderr = tempfile::tempfile().map_err(SshBootstrapError::LocalFile)?;
-    let mut child = Command::new(ssh_program)
+    let mut child = background_command(ssh_program)
         .args(["-T", "-n", destination, &remote_command])
         .stdin(Stdio::null())
         .stdout(Stdio::from(
@@ -7126,7 +7129,7 @@ fn run_fenced_ssh_command_with_output_limit(
             .map_or(remote_command.as_str(), |script| {
                 script.remote_command.as_str()
             });
-        let mut command = Command::new("ssh");
+        let mut command = background_command("ssh");
         command.arg("-T");
         if target.is_windows() {
             // Windows mutations consume their payload from the owned mailbox.
@@ -7349,7 +7352,7 @@ fn run_sftp_batch(
     destination: &str,
     batch: &str,
 ) -> Result<(bool, SshStderrClassification), SshBootstrapError> {
-    let mut child = Command::new("sftp")
+    let mut child = background_command("sftp")
         .args(["-q", "-b", "-", destination])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -7574,7 +7577,7 @@ fn run_program_with_output_limit<const N: usize>(
     arguments: [&OsStr; N],
     output_limit: usize,
 ) -> Result<CommandOutput, SshBootstrapError> {
-    let mut child = Command::new(program)
+    let mut child = background_command(program)
         .args(arguments)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -7614,7 +7617,7 @@ fn run_program_with_output_limit<const N: usize>(
     // handles preserve bounded capture without triggering that OpenSSH bug.
     let mut stdout = tempfile::tempfile().map_err(SshBootstrapError::LocalFile)?;
     let mut stderr = tempfile::tempfile().map_err(SshBootstrapError::LocalFile)?;
-    let mut child = Command::new(program)
+    let mut child = background_command(program)
         .args(arguments)
         .stdin(Stdio::null())
         .stdout(Stdio::from(
