@@ -34,11 +34,13 @@ impl<'a, T> CommandGroupBuilder<'a, T> {
 }
 
 #[cfg(all(windows, test))]
-pub(crate) fn hidden_console_probe_command() -> std::process::Command {
+pub(crate) fn hidden_console_probe_command(
+    build: impl FnOnce(std::path::PathBuf) -> std::process::Command,
+) -> std::process::Command {
     let system_root = std::env::var_os("SystemRoot").expect("Windows system root");
     let powershell = std::path::PathBuf::from(system_root)
         .join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
-    let mut command = std::process::Command::new(powershell);
+    let mut command = build(powershell);
     command.args(["-NoProfile", "-NonInteractive", "-Command", r#"
 Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public static class SatelleConsoleProbe { [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow(); }'
 if ([SatelleConsoleProbe]::GetConsoleWindow() -ne [IntPtr]::Zero) { exit 41 }

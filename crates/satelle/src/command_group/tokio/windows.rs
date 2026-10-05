@@ -53,7 +53,8 @@ mod tests {
 
     #[tokio::test]
     async fn background_async_group_has_no_console_and_preserves_output() {
-        let command = crate::command_group::builder::hidden_console_probe_command();
+        let command =
+            crate::command_group::builder::hidden_console_probe_command(std::process::Command::new);
         let output = tokio::process::Command::from(command)
             .group_spawn()
             .expect("start hidden async Windows child")

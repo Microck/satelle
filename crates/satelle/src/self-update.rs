@@ -1,5 +1,6 @@
 use flate2::read::GzDecoder;
 use reqwest::blocking::{Client, Response};
+use satelle::command_group::background_command;
 use satelle::core::{ErrorCode, SatelleError};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -8,7 +9,7 @@ use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Child, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::{TempDir, tempdir};
@@ -1296,7 +1297,7 @@ fn manager_command_lines_bounded(
     let child_stdout = stdout
         .try_clone()
         .map_err(|_| ManagerProbeError::OutputRead)?;
-    let mut child = Command::new(program)
+    let mut child = background_command(program)
         .args(arguments)
         .stdout(Stdio::from(child_stdout))
         .stderr(Stdio::null())
@@ -1644,7 +1645,7 @@ fn require_release_verifier() -> Result<(), SelfUpdateError> {
 }
 
 fn require_release_verifier_with(program: &Path) -> Result<(), SelfUpdateError> {
-    let mut child = Command::new(program)
+    let mut child = background_command(program)
         .args(["auth", "status", "--active", "--hostname", "github.com"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -1683,7 +1684,7 @@ fn verify_release_attestation(archive: &Path, version: &str) -> Result<(), SelfU
         return Err(SelfUpdateError::ReleaseMetadataInvalid);
     }
 
-    let mut command = Command::new("gh");
+    let mut command = background_command("gh");
     command
         .args([
             "attestation",
@@ -1729,7 +1730,7 @@ fn run_gh_line_with(program: &Path, arguments: &[&str]) -> Result<String, SelfUp
     // child before draining a pipe can deadlock if it fills the pipe buffer.
     let mut stdout = tempfile::tempfile().map_err(SelfUpdateError::GhOutput)?;
     let child_stdout = stdout.try_clone().map_err(SelfUpdateError::GhOutput)?;
-    let mut child = Command::new(program)
+    let mut child = background_command(program)
         .args(arguments)
         .stdin(Stdio::null())
         .stdout(Stdio::from(child_stdout))
@@ -1851,7 +1852,7 @@ fn create_executable_file(path: &Path) -> Result<File, SelfUpdateError> {
 fn verify_binary_version(executable: &Path, version: &str) -> Result<(), SelfUpdateError> {
     let mut stdout = tempfile::tempfile().map_err(SelfUpdateError::BinarySmoke)?;
     let child_stdout = stdout.try_clone().map_err(SelfUpdateError::BinarySmoke)?;
-    let mut child = Command::new(executable)
+    let mut child = background_command(executable)
         .arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::from(child_stdout))

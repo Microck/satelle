@@ -1,7 +1,8 @@
+use satelle::command_group::background_command;
 use std::ffi::OsString;
 use std::io::{self, Read};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
-use std::process::{Child, ChildStderr, Command, Stdio};
+use std::process::{Child, ChildStderr, Stdio};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -33,7 +34,7 @@ impl SshTunnel {
             .map_err(SshTunnelError::PortAllocation)?;
         drop(reservation);
 
-        let mut command = Command::new("ssh");
+        let mut command = background_command("ssh");
         command
             .args(ssh_arguments(destination, local_addr.port(), remote_port))
             .stdin(Stdio::null())

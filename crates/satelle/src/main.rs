@@ -95,7 +95,9 @@ use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
 use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command as ProcessCommand, ExitCode, Stdio};
+#[cfg(target_os = "macos")]
+use std::process::Command as ProcessCommand;
+use std::process::{ExitCode, Stdio};
 use std::str::FromStr;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -2215,7 +2217,7 @@ impl ControllerTelemetryCapture {
             Err(_) => return,
         };
         let duration_ms = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        let mut child = ProcessCommand::new(executable);
+        let mut child = satelle::command_group::background_command(executable);
         child
             .arg("telemetry")
             .arg("__deliver")
@@ -7621,7 +7623,7 @@ fn run_captured_doctor_fix_target(
             Some(source.to_string()),
         ))
     })?;
-    let output = ProcessCommand::new(executable)
+    let output = satelle::command_group::background_command(executable)
         .args(&arguments)
         .stdin(std::process::Stdio::null())
         .output()
@@ -15084,7 +15086,7 @@ fn run_self_update_remote_handoff(
             Some(error.to_string()),
         ))
     })?;
-    let mut child = ProcessCommand::new(installed_executable)
+    let mut child = satelle::command_group::background_command(installed_executable)
         .args(handoff.arguments())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
