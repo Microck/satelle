@@ -1532,6 +1532,13 @@ fn map_ssh_daemon_bootstrap_error(
             );
             error
         }
+        ssh_bootstrap::SshBootstrapError::WindowsBootstrapFailed(stage) => {
+            let mut error = SatelleError::host_unreachable(alias);
+            error
+                .details
+                .insert("bootstrap_stage".to_string(), serde_json::json!(stage));
+            error
+        }
         _ => SatelleError::host_unreachable(alias),
     }
 }

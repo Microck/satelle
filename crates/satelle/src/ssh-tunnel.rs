@@ -15,6 +15,41 @@ const HOST_KEY_FAILURE_MARKERS: [&[u8]; 2] = [
     b"REMOTE HOST IDENTIFICATION HAS CHANGED!",
 ];
 
+const WINDOWS_BOOTSTRAP_FAILURE_MARKERS: [(&[u8], &str); 17] = [
+    (b"satelle-bootstrap-stage:native-helper;", "native-helper"),
+    (b"satelle-bootstrap-stage:null-output;", "null-output"),
+    (b"satelle-bootstrap-stage:binary-path;", "binary-path"),
+    (b"satelle-bootstrap-stage:fenced-launch;", "fenced-launch"),
+    (b"satelle-bootstrap-stage:fenced-marker;", "fenced-marker"),
+    (b"satelle-bootstrap-stage:stdin-handle;", "stdin-handle"),
+    (b"satelle-bootstrap-stage:stdout-handle;", "stdout-handle"),
+    (b"satelle-bootstrap-stage:stderr-handle;", "stderr-handle"),
+    (
+        b"satelle-bootstrap-stage:stdin-inheritance;",
+        "stdin-inheritance",
+    ),
+    (
+        b"satelle-bootstrap-stage:stdout-inheritance;",
+        "stdout-inheritance",
+    ),
+    (
+        b"satelle-bootstrap-stage:stderr-inheritance;",
+        "stderr-inheritance",
+    ),
+    (
+        b"satelle-bootstrap-stage:null-inheritance;",
+        "null-inheritance",
+    ),
+    (b"satelle-bootstrap-stage:stdout-sink;", "stdout-sink"),
+    (b"satelle-bootstrap-stage:stderr-sink;", "stderr-sink"),
+    (b"satelle-bootstrap-stage:process-start;", "process-start"),
+    (
+        b"satelle-bootstrap-stage:bootstrap-token;",
+        "bootstrap-token",
+    ),
+    (b"satelle-bootstrap-stage:handle-restore;", "handle-restore"),
+];
+
 pub(super) struct SshTunnel {
     child: Child,
     local_addr: SocketAddr,
@@ -137,6 +172,7 @@ fn spawn_stderr_reader(
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) struct SshStderrClassification {
     host_key_verification_failed: bool,
+    pub(super) windows_bootstrap_failure_stage: Option<&'static str>,
 }
 
 impl SshStderrClassification {
@@ -148,6 +184,7 @@ impl SshStderrClassification {
 pub(super) fn classify_stderr(mut stderr: impl Read) -> SshStderrClassification {
     let mut classification = SshStderrClassification::default();
     let mut marker_offsets = [0_usize; HOST_KEY_FAILURE_MARKERS.len()];
+    let mut stage_offsets = [0_usize; WINDOWS_BOOTSTRAP_FAILURE_MARKERS.len()];
     let mut buffer = [0_u8; 4096];
     loop {
         let count = match stderr.read(&mut buffer) {
@@ -155,6 +192,20 @@ pub(super) fn classify_stderr(mut stderr: impl Read) -> SshStderrClassification 
             Ok(count) => count,
         };
         for byte in &buffer[..count] {
+            for ((marker, stage), offset) in WINDOWS_BOOTSTRAP_FAILURE_MARKERS
+                .iter()
+                .zip(stage_offsets.iter_mut())
+            {
+                if *byte == marker[*offset] {
+                    *offset += 1;
+                    if *offset == marker.len() {
+                        classification.windows_bootstrap_failure_stage = Some(stage);
+                        *offset = 0;
+                    }
+                } else {
+                    *offset = usize::from(*byte == marker[0]);
+                }
+            }
             for (marker, offset) in HOST_KEY_FAILURE_MARKERS
                 .iter()
                 .zip(marker_offsets.iter_mut())
@@ -221,6 +272,23 @@ mod tests {
                 "operator@example",
             ]
             .map(OsString::from)
+        );
+    }
+
+    #[test]
+    fn windows_failure_stages_survive_read_boundaries_without_retaining_remote_text() {
+        for (marker, stage) in WINDOWS_BOOTSTRAP_FAILURE_MARKERS {
+            let mut diagnostic = vec![b'x'; 4090];
+            diagnostic.extend_from_slice(marker);
+            diagnostic.extend_from_slice(b" secret-canary remote-controlled-text");
+            assert_eq!(
+                classify_stderr(diagnostic.as_slice()).windows_bootstrap_failure_stage,
+                Some(stage)
+            );
+        }
+        assert_eq!(
+            classify_stderr(&b"satelle-bootstrap-stage:unknown; secret-canary"[..]),
+            SshStderrClassification::default()
         );
     }
 

@@ -1100,12 +1100,19 @@ impl SshBootstrapProcess {
             host_config.into(),
         );
         let command = bootstrap_lock.fenced_command(target, "daemon_start", &command)?;
-        require_success(run_fenced_ssh_command(
+        let output = run_fenced_ssh_command(
             destination,
             target,
             command,
             Some(FencedMutationInput::BootstrapToken(token)),
-        )?)
+        )?;
+        let stage = output.stderr.windows_bootstrap_failure_stage;
+        require_success(output).map_err(|error| match (error, stage) {
+            (SshBootstrapError::RemoteOperationFailed, Some(stage)) => {
+                SshBootstrapError::WindowsBootstrapFailed(stage)
+            }
+            (error, _) => error,
+        })
     }
 
     fn spawn(
@@ -2088,6 +2095,7 @@ if ($payloadItem.PSIsContainer -or
       (Test-Path -LiteralPath $resultPath))) -or
     ((-not $fileBackedResult) -and ((Test-Path -LiteralPath $pendingReadyPath) -or
       (Test-Path -LiteralPath $readyPath)))) {{ exit 75 }}
+$diagnosticStage = 'fenced-marker'
 try {{
   (Open-OwnerOnlyFile (Join-Path $claimPath ('execution_started.' + $attempt)) ([IO.FileMode]::CreateNew)).Dispose()
   $status = 0
@@ -2099,12 +2107,17 @@ try {{
     # File redirection avoids the anonymous-pipe wait that Windows OpenSSH can
     # retain after the child exits. Dispose the Process before removing input;
     # Windows PowerShell 5 otherwise keeps that redirected file handle open.
+    $diagnosticStage = 'fenced-launch'
     $process = Start-Process -FilePath 'powershell.exe' `
       -ArgumentList @('-NoProfile', '-NonInteractive', '-EncodedCommand', $encodedCommand) `
       -RedirectStandardInput $payloadPath `
       -RedirectStandardOutput $stdoutPath `
       -RedirectStandardError $stderrPath `
-      -WindowStyle Hidden -Wait -PassThru
+      -WindowStyle Hidden -PassThru
+    # Start-Process with redirected files does not retain its process handle.
+    # Cache it before waiting so Windows PowerShell 5 can report the exit code.
+    [void]$process.Handle
+    $process.WaitForExit()
     $status = $process.ExitCode
     $process.Dispose()
   }} else {{
@@ -2162,6 +2175,9 @@ try {{
   }}
 }} catch {{
   $status = 1
+  if ($fileBackedResult) {{
+    [IO.File]::AppendAllText($stderrPath, 'satelle-bootstrap-stage:' + $diagnosticStage + ';', (New-Object Text.UTF8Encoding($false)))
+  }}
 }} finally {{
   Remove-Item -LiteralPath $pendingPayloadPath -Force -ErrorAction SilentlyContinue
   Remove-Item -LiteralPath $payloadPath -Force -ErrorAction SilentlyContinue
@@ -3052,6 +3068,9 @@ printf 'removed=%s\nretained=%s\n' "$removed" "$retained""#,
             readiness_timeouts.native.as_millis(),
             readiness_timeouts.provider.as_millis(),
         );
+        if self.is_windows() {
+            timeout_args.push_str(" --interactive-bootstrap");
+        }
         if platform_log_sink {
             timeout_args.push_str(" --platform-log-sink");
         }
@@ -3090,9 +3109,11 @@ printf 'removed=%s\nretained=%s\n' "$removed" "$retained""#,
         if self.is_windows() {
             let script = format!(
                 concat!(
-                    "{}Add-Type -TypeDefinition '",
+                    "{}$diagnosticStage = 'native-helper'; try {{ Add-Type -TypeDefinition '",
                     "using System; using System.Runtime.InteropServices; ",
                     "public static class SatelleBootstrapNative {{ ",
+                    "[DllImport(\"kernel32.dll\", CharSet=CharSet.Unicode, ExactSpelling=true, SetLastError=true)] ",
+                    "public static extern Microsoft.Win32.SafeHandles.SafeFileHandle CreateFileW(string name, uint access, uint share, IntPtr security, uint creation, uint attributes, IntPtr template); ",
                     "[DllImport(\"kernel32.dll\", SetLastError=true)] ",
                     "public static extern IntPtr GetStdHandle(int stream); ",
                     "[DllImport(\"kernel32.dll\", SetLastError=true)] ",
@@ -3106,29 +3127,29 @@ printf 'removed=%s\nretained=%s\n' "$removed" "$retained""#,
                     "$originalOutput = [SatelleBootstrapNative]::GetStdHandle(-11); ",
                     "$originalError = [SatelleBootstrapNative]::GetStdHandle(-12); ",
                     "[uint32]$inputFlags = 0; [uint32]$outputFlags = 0; [uint32]$errorFlags = 0; ",
-                    "if (-not [SatelleBootstrapNative]::GetHandleInformation($originalInput,[ref]$inputFlags)) {{ exit 1 }}; ",
-                    "if (-not [SatelleBootstrapNative]::GetHandleInformation($originalOutput,[ref]$outputFlags)) {{ exit 1 }}; ",
-                    "if (-not [SatelleBootstrapNative]::GetHandleInformation($originalError,[ref]$errorFlags)) {{ exit 1 }}; ",
-                    "$nullOutput = [IO.File]::Open('NUL',[IO.FileMode]::Open,[IO.FileAccess]::Write,[IO.FileShare]::ReadWrite); ",
-                    "$nullHandle = $nullOutput.SafeFileHandle.DangerousGetHandle(); ",
-                    "$binary = (Resolve-Path -LiteralPath {}).Path; ",
+                    "if (-not [SatelleBootstrapNative]::GetHandleInformation($originalInput,[ref]$inputFlags)) {{ [Console]::Error.WriteLine(\"satelle-bootstrap-stage:stdin-handle;\"); exit 1 }}; ",
+                    "if (-not [SatelleBootstrapNative]::GetHandleInformation($originalOutput,[ref]$outputFlags)) {{ [Console]::Error.WriteLine(\"satelle-bootstrap-stage:stdout-handle;\"); exit 1 }}; ",
+                    "if (-not [SatelleBootstrapNative]::GetHandleInformation($originalError,[ref]$errorFlags)) {{ [Console]::Error.WriteLine(\"satelle-bootstrap-stage:stderr-handle;\"); exit 1 }}; ",
+                    "$diagnosticStage = 'null-output'; $nullOutput = [SatelleBootstrapNative]::CreateFileW('NUL',0x40000000,3,[IntPtr]::Zero,3,0x80,[IntPtr]::Zero); if ($nullOutput.IsInvalid) {{ throw 'satelle-bootstrap-stage:null-output;' }}; ",
+                    "$nullHandle = $nullOutput.DangerousGetHandle(); ",
+                    "$diagnosticStage = 'binary-path'; $binary = (Resolve-Path -LiteralPath {} -ErrorAction Stop).Path; ",
                     "$process = $null; try {{ ",
-                    "if (-not [SatelleBootstrapNative]::SetHandleInformation($originalInput,1,0)) {{ throw 'stdin inheritance' }}; ",
-                    "if (-not [SatelleBootstrapNative]::SetHandleInformation($originalOutput,1,0)) {{ throw 'stdout inheritance' }}; ",
-                    "if (-not [SatelleBootstrapNative]::SetHandleInformation($originalError,1,0)) {{ throw 'stderr inheritance' }}; ",
-                    "if (-not [SatelleBootstrapNative]::SetHandleInformation($nullHandle,1,1)) {{ throw 'null inheritance' }}; ",
-                    "if (-not [SatelleBootstrapNative]::SetStdHandle(-11,$nullHandle)) {{ throw 'stdout sink' }}; ",
-                    "if (-not [SatelleBootstrapNative]::SetStdHandle(-12,$nullHandle)) {{ throw 'stderr sink' }}; ",
-                    "$startInfo = New-Object System.Diagnostics.ProcessStartInfo; ",
+                    "$diagnosticStage = 'stdin-inheritance'; if (-not [SatelleBootstrapNative]::SetHandleInformation($originalInput,1,0)) {{ throw 'satelle-bootstrap-stage:stdin-inheritance;' }}; ",
+                    "$diagnosticStage = 'stdout-inheritance'; if (-not [SatelleBootstrapNative]::SetHandleInformation($originalOutput,1,0)) {{ throw 'satelle-bootstrap-stage:stdout-inheritance;' }}; ",
+                    "$diagnosticStage = 'stderr-inheritance'; if (-not [SatelleBootstrapNative]::SetHandleInformation($originalError,1,0)) {{ throw 'satelle-bootstrap-stage:stderr-inheritance;' }}; ",
+                    "$diagnosticStage = 'null-inheritance'; if (-not [SatelleBootstrapNative]::SetHandleInformation($nullHandle,1,1)) {{ throw 'satelle-bootstrap-stage:null-inheritance;' }}; ",
+                    "$diagnosticStage = 'stdout-sink'; if (-not [SatelleBootstrapNative]::SetStdHandle(-11,$nullHandle)) {{ throw 'satelle-bootstrap-stage:stdout-sink;' }}; ",
+                    "$diagnosticStage = 'stderr-sink'; if (-not [SatelleBootstrapNative]::SetStdHandle(-12,$nullHandle)) {{ throw 'satelle-bootstrap-stage:stderr-sink;' }}; ",
+                    "$diagnosticStage = 'process-start'; $startInfo = New-Object System.Diagnostics.ProcessStartInfo; ",
                     "$startInfo.FileName = $binary; $startInfo.Arguments = {}; ",
                     "$startInfo.UseShellExecute = $false; $startInfo.CreateNoWindow = $true; ",
                     "$startInfo.RedirectStandardInput = $true; ",
                     "$startInfo.RedirectStandardOutput = $false; ",
                     "$startInfo.RedirectStandardError = $false; ",
                     "$process = New-Object System.Diagnostics.Process; $process.StartInfo = $startInfo; ",
-                    "if (-not $process.Start()) {{ throw 'process start' }}; ",
-                    "$token = [Console]::In.ReadLine(); ",
-                    "if ([String]::IsNullOrEmpty($token)) {{ $process.Kill(); throw 'bootstrap token' }}; ",
+                    "if (-not $process.Start()) {{ throw 'satelle-bootstrap-stage:process-start;' }}; ",
+                    "$diagnosticStage = 'bootstrap-token'; $token = [Console]::In.ReadLine(); ",
+                    "if ([String]::IsNullOrEmpty($token)) {{ $process.Kill(); throw 'satelle-bootstrap-stage:bootstrap-token;' }}; ",
                     "$process.StandardInput.WriteLine($token); $process.StandardInput.Close() ",
                     "}} finally {{ ",
                     "$restoreInput = [SatelleBootstrapNative]::SetStdHandle(-10,$originalInput); ",
@@ -3138,8 +3159,8 @@ printf 'removed=%s\nretained=%s\n' "$removed" "$retained""#,
                     "$restoreOutputFlags = [SatelleBootstrapNative]::SetHandleInformation($originalOutput,1,($outputFlags -band 1)); ",
                     "$restoreErrorFlags = [SatelleBootstrapNative]::SetHandleInformation($originalError,1,($errorFlags -band 1)); ",
                     "$nullOutput.Dispose(); if ($null -ne $process) {{ $process.Dispose() }}; ",
-                    "if (-not ($restoreInput -and $restoreOutput -and $restoreError -and $restoreInputFlags -and $restoreOutputFlags -and $restoreErrorFlags)) {{ throw 'standard handle restore' }} ",
-                    "}}"
+                    "if (-not ($restoreInput -and $restoreOutput -and $restoreError -and $restoreInputFlags -and $restoreOutputFlags -and $restoreErrorFlags)) {{ $diagnosticStage = 'handle-restore'; throw 'satelle-bootstrap-stage:handle-restore;' }} ",
+                    "}} }} catch {{ [Console]::Error.WriteLine('satelle-bootstrap-stage:' + $diagnosticStage + ';'); throw }}"
                 ),
                 powershell_environment(environment),
                 powershell_quote(remote_binary),
@@ -7940,6 +7961,8 @@ pub(super) enum SshBootstrapError {
     LocalFile(#[source] io::Error),
     #[error("a remote bootstrap operation failed")]
     RemoteOperationFailed,
+    #[error("Windows bootstrap failed at launch stage {0}")]
+    WindowsBootstrapFailed(&'static str),
     #[error("timed out acquiring the remote SSH bootstrap lock")]
     BootstrapLockTimedOut,
     #[error("another remote SSH bootstrap operation is already active")]
@@ -10100,6 +10123,19 @@ try {{
     }
 
     #[test]
+    fn ordinary_ssh_failures_do_not_adopt_durable_launch_stage_markers() {
+        let output = CommandOutput {
+            status: RemoteExitStatus::from_code(1),
+            stdout: Vec::new(),
+            stderr: classify_stderr(&b"satelle-bootstrap-stage:null-output;"[..]),
+        };
+        assert!(matches!(
+            require_success(output),
+            Err(SshBootstrapError::RemoteOperationFailed)
+        ));
+    }
+
+    #[test]
     fn bootstrap_lock_ready_error_preserves_host_key_classification() {
         let host_key_error = classify_bootstrap_lock_ready_error(
             SshBootstrapError::InvalidBootstrapLockResponse,
@@ -11162,6 +11198,9 @@ try {{
         assert!(script.contains("-RedirectStandardInput $payloadPath"));
         assert!(script.contains("-RedirectStandardOutput $stdoutPath"));
         assert!(script.contains("-RedirectStandardError $stderrPath"));
+        assert!(script.contains("-WindowStyle Hidden -PassThru"));
+        assert_occurs_before(&script, "[void]$process.Handle", "$process.WaitForExit()");
+        assert!(!script.contains("-WindowStyle Hidden -Wait"));
         assert!(script.contains("$process.Dispose()"));
         assert!(script.contains("mutation-result."));
         assert!(script.contains("[IO.File]::Move($pendingResultPath, $resultPath)"));
@@ -11212,8 +11251,12 @@ try {{
                 false,
             ));
         assert!(streaming_windows.contains("$fileBackedResult = $false"));
+        let foreground_script = streaming_windows
+            .split_once("# A foreground daemon")
+            .expect("foreground launch branch")
+            .1;
         assert_occurs_before(
-            &script,
+            foreground_script,
             "Remove-Item -LiteralPath $payloadPath -Force -ErrorAction Stop",
             "$process.WaitForExit()",
         );
@@ -12076,8 +12119,8 @@ try {{
             "GetHandleInformation($originalInput,[ref]$inputFlags)",
             "GetHandleInformation($originalOutput,[ref]$outputFlags)",
             "GetHandleInformation($originalError,[ref]$errorFlags)",
-            "$nullOutput = [IO.File]::Open('NUL'",
-            "$nullOutput.SafeFileHandle.DangerousGetHandle()",
+            "$nullOutput = [SatelleBootstrapNative]::CreateFileW('NUL'",
+            "$nullOutput.DangerousGetHandle()",
             "SetHandleInformation($originalInput,1,0)",
             "SetHandleInformation($originalOutput,1,0)",
             "SetHandleInformation($originalError,1,0)",
@@ -12151,6 +12194,131 @@ try {{
         assert!(!script.contains("SATELLE_BOOTSTRAP_TOKEN"));
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_fenced_launcher_retains_the_redirected_child_exit_code() {
+        let root = tempfile::tempdir().expect("redirected launcher fixture");
+        let command = powershell_encoded_command("exit 37");
+        let production =
+            RemoteTarget::WindowsX64Msvc.fenced_mutation_command(FencedMutationContext::new(
+                "fixture-operation",
+                "0123456789abcdef0123456789abcdef",
+                "claim.fixture-operation.nonce",
+                "daemon_start",
+                "fedcba9876543210fedcba9876543210",
+                &command,
+                true,
+            ));
+        let launcher = production
+            .split_once("$process = Start-Process")
+            .unwrap()
+            .1
+            .split_once("$process.Dispose()")
+            .unwrap()
+            .0;
+        let script = format!(
+            r#"$ErrorActionPreference = 'Stop'
+$root = {root}
+$payloadPath = Join-Path $root 'input'
+$stdoutPath = Join-Path $root 'stdout'
+$stderrPath = Join-Path $root 'stderr'
+[IO.File]::WriteAllText($payloadPath, 'fixture input')
+$encodedCommand = {encoded}
+$process = Start-Process{launcher}
+$process.Dispose()
+if ($status -ne 37) {{ throw 'redirected child exit code was lost' }}
+"#,
+            root = powershell_quote(&root.path().to_string_lossy()),
+            encoded = powershell_quote(
+                command
+                    .strip_prefix("powershell.exe -NoProfile -NonInteractive -EncodedCommand ",)
+                    .unwrap()
+            ),
+        );
+        let output = background_command("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command"])
+            .arg(script)
+            .output()
+            .expect("run real redirected fenced launcher");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_durable_launcher_opens_native_null_device_and_delivers_stdin() {
+        let directory = tempfile::tempdir().expect("create launcher receipt directory");
+        let receipt = directory.path().join("receipt.txt");
+        let powershell = std::env::var("SystemRoot").expect("Windows system root")
+            + "\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
+        let command = RemoteTarget::WindowsX64Msvc.durable_start_command(
+            &powershell,
+            Duration::from_secs(75),
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+        );
+        let mut script = decode_powershell_command(&command).expect("decode production launcher");
+        // Exercise the production handle setup with a real child. Its output
+        // must go to NUL while its stdin arrives through the dedicated pipe.
+        let child = format!(
+            "$token = [Console]::In.ReadLine(); [Console]::Out.WriteLine('discarded-output'); [IO.File]::WriteAllText({0} + '.pending', $token); [IO.File]::Move({0} + '.pending', {0})",
+            powershell_quote(&receipt.to_string_lossy()),
+        );
+        let child_command = powershell_encoded_command(&child);
+        let args_start = script
+            .find("$startInfo.Arguments = ")
+            .expect("child arguments")
+            + "$startInfo.Arguments = ".len();
+        let args_end = script[args_start..]
+            .find("; $startInfo.UseShellExecute")
+            .expect("argument terminator")
+            + args_start;
+        script.replace_range(
+            args_start..args_end,
+            &powershell_quote(child_command.strip_prefix("powershell.exe ").unwrap()),
+        );
+        let encoded_command = powershell_encoded_command(&script);
+        let encoded_script = encoded_command
+            .strip_prefix("powershell.exe -NoProfile -NonInteractive -EncodedCommand ")
+            .unwrap();
+        let mut process = background_command("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-EncodedCommand",
+                encoded_script,
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start production launcher");
+        process
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"launcher-test-token\n")
+            .expect("send test token");
+        let output = process.wait_with_output().expect("wait for launcher");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stdout.is_empty());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !receipt.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            std::fs::read_to_string(receipt).expect("child received token"),
+            "launcher-test-token"
+        );
+    }
+
     #[test]
     fn durable_start_commands_detach_and_forward_the_resolved_timeouts() {
         let idle_timeout = Duration::from_secs(75);
@@ -12186,6 +12354,7 @@ try {{
         assert!(script.contains("--bootstrap-scope read"));
         assert!(script.contains("--bootstrap-native-readiness-timeout-ms 2500"));
         assert!(script.contains("--bootstrap-provider-smoke-timeout-ms 7500"));
+        assert!(script.contains("--interactive-bootstrap"));
         assert!(!script.contains("--bootstrap-operation-id"));
         assert!(!script.contains("--bootstrap-operation-kind"));
         assert!(script.contains("RedirectStandardInput = $true"));
