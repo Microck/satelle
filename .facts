@@ -2581,3 +2581,5 @@
 - satelle native repair refuses unknown or ambiguous installation owners with native-repair-owner-unknown and directs the operator to the verified direct native release installation; a failed package-manager operation returns native-repair-failed and never claims success @spec @contract @phase4
 
 - macOS saved app approval reads have a bounded process lifetime; stalled access returns a typed Computer Use readiness error, never an inferred grant, while control-service startup never reads saved app approvals and capability requests validate readiness after startup @spec @mvp @implemented
+
+- default-feature library unit tests compile their existing fixtures under cfg(test), while integration-test fixture APIs remain available through the explicit test-support feature; Linux CI checks the default-feature unit-test build alongside all-feature verification @spec @contract @implemented
