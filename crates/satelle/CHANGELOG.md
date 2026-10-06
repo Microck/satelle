@@ -1,3 +1,13 @@
+## satelle@0.1.37
+
+### SSH setup recovery
+
+Stop SSH jump processes before draining command output so setup can return when the remote command exits or fails.
+
+### Windows persistent Host setup
+
+Stage task-observation PowerShell scripts through the existing file transport so persistent setup does not exceed the Windows SSH command-line limit. Preserve task identity checks, drift detection and script cleanup.
+
 ## satelle@0.1.35
 
 ### Host maintenance recovery

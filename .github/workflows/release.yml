@@ -316,7 +316,6 @@ jobs:
             validated/release-orchestration.json
 
       - name: Verify committed Tegami changelog output
-        if: startsWith(github.ref, 'refs/tags/v')
         env:
           RELEASE_VERSION: ${{ steps.plan.outputs.version }}
         run: |
