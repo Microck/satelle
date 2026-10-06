@@ -346,7 +346,7 @@ impl HostCommand {
     const fn output_request(&self) -> (OutputArgs, EventOutput) {
         match self {
             Self::Start(command) => (command.output_args, EventOutput::None),
-            Self::RecoverBootstrapBegin(command) => (command.output_args, EventOutput::None),
+            Self::RecoverBootstrap(command) => (command.output_args, EventOutput::None),
             Self::ReleaseState => (
                 OutputArgs {
                     format: None,

@@ -2284,7 +2284,7 @@ foreach ($body in @('satelle.exe host status', 'Write-Output unrelated')) {{
         assert!(protocol.close().success());
         // Model an elapsed heartbeat after the real producer lost its input.
         fs::write(claim.join("heartbeat_at"), "2026-01-01T00:00:00Z\n").unwrap();
-        let plan = satelle::host::HostService::recover_bootstrap_begin_without_run(
+        let plan = satelle::host::HostService::recover_bootstrap_claim(
             &store,
             &bootstrap,
             &host_identity,
@@ -2294,7 +2294,7 @@ foreach ($body in @('satelle.exe host status', 'Write-Output unrelated')) {{
         .unwrap();
         assert!(!plan.changed);
         assert!(claim.is_dir());
-        let recovered = satelle::host::HostService::recover_bootstrap_begin_without_run(
+        let recovered = satelle::host::HostService::recover_bootstrap_claim(
             &store,
             &bootstrap,
             &host_identity,

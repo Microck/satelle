@@ -54,6 +54,23 @@ Session identifiers, local paths, prompts, transcripts, and desktop content.
 Never share bearer tokens, provider secrets, private keys, or authorization
 headers. Follow the repository security policy for suspected vulnerabilities.
 
+## Recover an interrupted setup claim
+
+A completed setup can retain its Bootstrap Lock if the Controller loses the
+completion response. Stop the Host service before owner-local recovery. Use
+its existing state roots, pinned Host identity, and exact setup operation ID:
+
+```sh
+satelle host recover-bootstrap --state-root <state-root> --bootstrap-state-root <bootstrap-state-root> --expected-host-id <host-id> --operation-id <operation-id> --dry-run --json
+```
+
+Apply that same reviewed command with `--yes` instead of `--dry-run`, then
+restart the Host service. Recovery archives the claim and a receipt. It keeps
+the completed ledger history, including actions safely skipped as already
+satisfied or not required. A live store owner, uncertain action, remaining
+lease, foreign claim, or non-ledger mutation phase prevents recovery. An
+interrupted begin with no remaining ledger run can use the same command.
+
 ## Reset an offline Host store
 
 After stopping the Host, an explicitly approved `satelle host store reset`
