@@ -1,6 +1,6 @@
 core:changelogs:
-  - content: "---\npackages:\n  cargo:satelle:\n    type: patch\n---\n\n## Host readiness status\n\nKeep Host capabilities responsive after setup invalidates native readiness evidence. Skip native runtime authentication when there is no live successful cache candidate, and require the full current authenticated identity before reusing a candidate.\n"
-    filename: readiness-status.md
+  - content: "---\npackages:\n  cargo:satelle:\n    type: patch\n---\n\n## Host maintenance recovery\n\nShow the operation reserving the Host and its recovery command instead of reporting a reachable Host as unreachable. Before maintenance, reconcile inactive native readiness probes through read-only provider observation. Release only confirmed terminal probes, preserve saved failures, and keep active or unknown probes protected.\n\n## Windows native readiness\n\nDerive native click and drag coordinates from the current screenshot’s logical dimensions so display scaling does not move the readiness targets outside the window. Reject missing dimensions before input and continue requiring independently observed native events.\n"
+    filename: native-readiness-recovery.md
     v: 0.0.0
 core:packages:
   - id: npm:satelle-repository
@@ -8,7 +8,7 @@ core:packages:
   - id: npm:satelle-docs
     updated: false
   - changelogIds:
-      - readiness-status.md
+      - native-readiness-recovery.md
     id: cargo:satelle
     updated: true
 npm:packages:

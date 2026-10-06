@@ -1,3 +1,17 @@
+## satelle@0.1.35
+
+### Host maintenance recovery
+
+Show the operation reserving the Host and its recovery command instead of reporting a reachable Host as unreachable. Before maintenance, reconcile inactive native readiness probes through read-only provider observation. Release only confirmed terminal probes, preserve saved failures, and keep active or unknown probes protected.
+
+### Windows native readiness
+
+Derive native click and drag coordinates from the current screenshot’s logical dimensions so display scaling does not move the readiness targets outside the window. Reject missing dimensions before input and continue requiring independently observed native events.
+
+### Codex installation diagnostics
+
+Explain disk exhaustion during package writes and flushes, preserve the selected runtime on failure, and keep the same setup recovery command across the Host API without exposing private diagnostics.
+
 ## satelle@0.1.34
 
 ### Host readiness status
