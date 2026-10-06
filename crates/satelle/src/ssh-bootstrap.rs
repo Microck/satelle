@@ -1,6 +1,5 @@
 use crate::self_update;
 use base64::Engine as _;
-use satelle::command_group::background_command;
 use satelle::core::session::HostIdentityRef;
 use satelle::core::{DaemonPathOverrides, HostConfig, SshIdentityCommitRecord};
 use satelle::host::{ApiBearerToken, readiness_probe_timeouts};
@@ -30,7 +29,10 @@ use zeroize::Zeroizing;
 
 use super::SshBootstrapScope;
 use super::bootstrap_lock;
-use super::ssh_tunnel::{SshStderrClassification, classify_stderr};
+use super::ssh_tunnel::{
+    SshStderrClassification, background_transport_command as background_command, classify_stderr,
+    retire_transport_child,
+};
 
 const PROBE_OUTPUT_LIMIT: usize = 4096;
 const OFFLINE_STORAGE_PLAN_LIMIT: usize = 64 * 1024;
@@ -592,6 +594,7 @@ impl SshBootstrapLock {
             .map_err(SshBootstrapError::InspectSsh)?
             .is_some()
         {
+            retire_transport_child(&mut child);
             let _ = stdout_reader.join();
             let classification = stderr_reader.join().unwrap_or_default();
             return Err(if classification.host_key_verification_failed() {
@@ -913,19 +916,17 @@ impl Drop for SshBootstrapLock {
             drop(stdin.take());
         }
         let deadline = Instant::now() + BOOTSTRAP_LOCK_EXIT_GRACE;
-        let exited = loop {
+        loop {
             match self.child.try_wait() {
-                Ok(Some(_)) => break true,
+                Ok(Some(_)) => break,
                 Ok(None) if Instant::now() < deadline => {
                     thread::sleep(BOOTSTRAP_LOCK_EXIT_POLL);
                 }
-                Ok(None) | Err(_) => break false,
+                Ok(None) | Err(_) => break,
             }
-        };
-        if !exited {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
         }
+        // Also retire jumps after a clean leader exit before joining readers.
+        retire_transport_child(&mut self.child);
         if let Some(reader) = self.stdout_reader.take() {
             let _ = reader.join();
         }
@@ -1238,6 +1239,7 @@ impl SshBootstrapProcess {
             .try_wait()
             .map_err(|error| terminate_child(&mut child, SshBootstrapError::InspectSsh(error)))?;
         if child_status.is_some() {
+            retire_transport_child(&mut child);
             let classification = stderr_reader.join().unwrap_or_default();
             return Err(if classification.host_key_verification_failed() {
                 SshBootstrapError::HostKeyVerificationRequired
@@ -1258,10 +1260,7 @@ impl SshBootstrapProcess {
 
 impl Drop for SshBootstrapProcess {
     fn drop(&mut self) {
-        if !matches!(self.child.try_wait(), Ok(Some(_))) {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
-        }
+        retire_transport_child(&mut self.child);
         if let Some(reader) = self.stdout_reader.take() {
             let _ = reader.join();
         }
@@ -3328,8 +3327,7 @@ fn run_windows_platform_probe_with_program(
         let (received, classification) = run_sftp_batch(destination, &receive)?;
         if received {
             if child_status.is_none() {
-                let _ = child.kill();
-                let _ = child.wait();
+                retire_transport_child(&mut child);
             }
             let probe = read_bounded(
                 File::open(local_result_path).map_err(SshBootstrapError::LocalFile)?,
@@ -7251,13 +7249,13 @@ fn run_fenced_ssh_command_with_output_limit(
                     stderr,
                 })
             })();
-            let _ = child.kill();
-            let _ = child.wait();
+            retire_transport_child(&mut child);
             let _ = stdout_reader.join();
             let _ = stderr_reader.join();
             return output;
         }
         let status = child.wait().map_err(SshBootstrapError::WaitSsh)?;
+        retire_transport_child(&mut child);
         let stdout = stdout_reader
             .join()
             .map_err(|_| SshBootstrapError::ReaderPanicked)??;
@@ -7405,6 +7403,7 @@ fn run_sftp_batch(
         .expect("SFTP stderr was configured as piped");
     let stderr = spawn_stderr_reader(stderr)?;
     let status = child.wait().map_err(SshBootstrapError::WaitSsh)?;
+    retire_transport_child(&mut child);
     let classification = stderr
         .join()
         .map_err(|_| SshBootstrapError::ReaderPanicked)?;
@@ -7624,6 +7623,7 @@ fn run_program_with_output_limit<const N: usize>(
     let stdout_reader = thread::spawn(move || read_bounded(stdout, output_limit));
     let stderr_reader = spawn_stderr_reader(stderr)?;
     let status = child.wait().map_err(SshBootstrapError::WaitSsh)?;
+    retire_transport_child(&mut child);
     let stdout = stdout_reader
         .join()
         .map_err(|_| SshBootstrapError::ReaderPanicked)??;
@@ -7663,14 +7663,12 @@ fn run_program_with_output_limit<const N: usize>(
         {
             Ok(exceeded) => exceeded,
             Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                retire_transport_child(&mut child);
                 return Err(error);
             }
         };
         if output_limit_exceeded {
-            let _ = child.kill();
-            let _ = child.wait();
+            retire_transport_child(&mut child);
             return Err(SshBootstrapError::ProcessOutputTooLarge);
         }
         match child.try_wait() {
@@ -7679,13 +7677,11 @@ fn run_program_with_output_limit<const N: usize>(
                 thread::sleep(Duration::from_millis(10));
             }
             Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                retire_transport_child(&mut child);
                 return Err(SshBootstrapError::ProcessTimedOut);
             }
             Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                retire_transport_child(&mut child);
                 return Err(SshBootstrapError::WaitSsh(error));
             }
         }
@@ -7887,8 +7883,7 @@ fn spawn_stderr_reader(
 }
 
 fn terminate_child(child: &mut Child, error: SshBootstrapError) -> SshBootstrapError {
-    let _ = child.kill();
-    let _ = child.wait();
+    retire_transport_child(child);
     error
 }
 

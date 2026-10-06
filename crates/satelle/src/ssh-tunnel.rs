@@ -2,6 +2,8 @@ use satelle::command_group::background_command;
 use std::ffi::OsString;
 use std::io::{self, Read};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::process::{Child, ChildStderr, Stdio};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -54,6 +56,39 @@ const WINDOWS_BOOTSTRAP_FAILURE_MARKERS: [(&[u8], &str); 18] = [
     ),
 ];
 
+// A jump process inherits SSH diagnostics. Give each transport its own group
+// so an exited leader cannot leave readers waiting on an orphaned jump process.
+pub(super) fn background_transport_command(
+    program: impl AsRef<std::ffi::OsStr>,
+) -> std::process::Command {
+    let command = background_command(program);
+    #[cfg(unix)]
+    {
+        let mut command = command;
+        command.process_group(0);
+        command
+    }
+    #[cfg(not(unix))]
+    command
+}
+
+pub(super) fn retire_transport_child(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        use nix::{
+            sys::signal::{Signal, killpg},
+            unistd::Pid,
+        };
+        let group = Pid::from_raw(i32::try_from(child.id()).expect("transport PID fits i32"));
+        // Kill the group even after the leader exits: its jump processes can
+        // still hold output pipes. This owns local transport only, not remote work.
+        let _ = killpg(group, Signal::SIGKILL);
+    }
+    #[cfg(not(unix))]
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 pub(super) struct SshTunnel {
     child: Child,
     local_addr: SocketAddr,
@@ -73,7 +108,7 @@ impl SshTunnel {
             .map_err(SshTunnelError::PortAllocation)?;
         drop(reservation);
 
-        let mut command = background_command("ssh");
+        let mut command = background_transport_command("ssh");
         command
             .args(ssh_arguments(destination, local_addr.port(), remote_port))
             .stdin(Stdio::null())
@@ -90,8 +125,7 @@ impl SshTunnel {
         let stderr_reader = match spawn_stderr_reader(stderr) {
             Ok(reader) => reader,
             Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                retire_transport_child(&mut child);
                 return Err(error);
             }
         };
@@ -139,6 +173,7 @@ impl SshTunnel {
     }
 
     fn exited_before_ready(&mut self) -> SshTunnelError {
+        retire_transport_child(&mut self.child);
         if self.finish_stderr_reader().host_key_verification_failed {
             SshTunnelError::HostKeyVerificationRequired
         } else {
@@ -156,11 +191,11 @@ impl SshTunnel {
 
 impl Drop for SshTunnel {
     fn drop(&mut self) {
-        if !matches!(self.child.try_wait(), Ok(Some(_))) {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
+        // An early-exit classification already retired the group and reader.
+        if self.stderr_reader.is_some() {
+            retire_transport_child(&mut self.child);
+            self.finish_stderr_reader();
         }
-        self.finish_stderr_reader();
     }
 }
 
@@ -261,6 +296,56 @@ pub(super) enum SshTunnelError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn transport_retirement_closes_descendant_pipes_after_leader_exit() {
+        use std::io::{BufRead, BufReader};
+        use std::sync::mpsc;
+
+        // Real descendants reproduce ProxyJump's inherited stderr without an
+        // SSH server or a mock. Cover both live and already-exited leaders.
+        for leader_exits in [false, true] {
+            let mut command = background_transport_command("sh");
+            command.args([
+                "-c",
+                if leader_exits {
+                    "sleep 30 >&2 & printf 'ready\n'; exit 0"
+                } else {
+                    "sleep 30 >&2 & printf 'ready\n'; wait"
+                },
+            ]);
+            let mut child = command
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("start transport process group");
+            let mut stdout = BufReader::new(child.stdout.take().expect("transport stdout"));
+            let mut ready = String::new();
+            stdout
+                .read_line(&mut ready)
+                .expect("read descendant start frame");
+            assert_eq!(ready, "ready\n");
+            if leader_exits {
+                assert!(child.wait().expect("wait for transport leader").success());
+            }
+            let stderr = child.stderr.take().expect("inherited transport stderr");
+            let (sender, receiver) = mpsc::channel();
+            let reader = thread::spawn(move || {
+                sender
+                    .send(classify_stderr(stderr))
+                    .expect("return drained diagnostics");
+            });
+            retire_transport_child(&mut child);
+            assert_eq!(
+                receiver
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("descendant pipe must close before reader join"),
+                SshStderrClassification::default()
+            );
+            reader.join().expect("join diagnostic reader");
+        }
+    }
 
     #[test]
     fn argv_is_loopback_only_and_contains_no_remote_command_or_host_key_bypass() {
