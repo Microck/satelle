@@ -3584,7 +3584,7 @@ impl<'a> PersistentServiceRemote<'a> {
             .as_deref()
             .ok_or(SshBootstrapError::InvalidPersistentServiceDefinition)?;
         let task = RegisteredWindowsTask::new(host_id, local_app_data)?;
-        match self.observe(&registered_windows_task_command(&task, "observe")?)? {
+        match self.observe_windows_script(&registered_windows_task_script(&task, "observe")?)? {
             PersistentServiceObservation::Running | PersistentServiceObservation::Stopped => {
                 Ok(task)
             }
@@ -3624,7 +3624,7 @@ impl<'a> PersistentServiceRemote<'a> {
         task: &satelle::core::daemon_service::WindowsTaskDefinition,
     ) -> Result<PersistentServiceObservation, SshBootstrapError> {
         self.require_platform(satelle::core::daemon_service::DaemonServicePlatform::Windows)?;
-        self.observe(&windows_task_observe_command(task))
+        self.observe_windows_script(&windows_task_observe_script(task))
     }
 
     pub(super) fn start_windows_task(
@@ -3646,7 +3646,7 @@ impl<'a> PersistentServiceRemote<'a> {
         task: &RegisteredWindowsTask,
     ) -> Result<(), SshBootstrapError> {
         self.require_platform(satelle::core::daemon_service::DaemonServicePlatform::Windows)?;
-        let command = registered_windows_task_command(task, "restart")?;
+        let command = powershell_encoded_command(&registered_windows_task_script(task, "restart")?);
         self.mutate("persistent_service_restart", &command, None)
     }
 
@@ -3655,7 +3655,7 @@ impl<'a> PersistentServiceRemote<'a> {
         task: &RegisteredWindowsTask,
     ) -> Result<(), SshBootstrapError> {
         self.require_platform(satelle::core::daemon_service::DaemonServicePlatform::Windows)?;
-        let command = registered_windows_task_command(task, "stop")?;
+        let command = powershell_encoded_command(&registered_windows_task_script(task, "stop")?);
         self.mutate("persistent_service_stop", &command, None)
     }
 
@@ -3664,7 +3664,7 @@ impl<'a> PersistentServiceRemote<'a> {
         task: &RegisteredWindowsTask,
     ) -> Result<PersistentServiceObservation, SshBootstrapError> {
         self.require_platform(satelle::core::daemon_service::DaemonServicePlatform::Windows)?;
-        self.observe(&registered_windows_task_command(task, "observe")?)
+        self.observe_windows_script(&registered_windows_task_script(task, "observe")?)
     }
 
     pub(super) fn launchd_definition(
@@ -3983,6 +3983,16 @@ impl<'a> PersistentServiceRemote<'a> {
             input,
             OFFLINE_STORAGE_RESULT_LIMIT,
         )
+    }
+
+    fn observe_windows_script(
+        &self,
+        script: &str,
+    ) -> Result<PersistentServiceObservation, SshBootstrapError> {
+        // Task-definition validation exceeds cmd.exe's command-line limit.
+        // Use the same staged-script transport as Windows bootstrap mutations.
+        let staged = stage_windows_powershell_script(self.destination, script, "service-observe")?;
+        self.observe(&staged.remote_command)
     }
 
     fn observe(&self, command: &str) -> Result<PersistentServiceObservation, SshBootstrapError> {
@@ -4633,7 +4643,7 @@ fn windows_task_definition_match_expression_for_values(
     )
 }
 
-fn windows_task_observe_command(
+fn windows_task_observe_script(
     task: &satelle::core::daemon_service::WindowsTaskDefinition,
 ) -> String {
     let (task_path, task_name) = windows_task_parts(task).expect("core task path is validated");
@@ -4653,7 +4663,7 @@ if ($matching) {{ Write-Output 'matching' }} else {{ Write-Output 'drifted' }}"#
         powershell_quote(task_name),
         definition_matches,
     );
-    powershell_encoded_command(&script)
+    script
 }
 
 pub(super) fn windows_task_instance_command(
@@ -4918,7 +4928,7 @@ try {{
     )
 }
 
-fn registered_windows_task_command(
+fn registered_windows_task_script(
     task: &RegisteredWindowsTask,
     action: &str,
 ) -> Result<String, SshBootstrapError> {
@@ -4995,7 +5005,7 @@ $matching=$executableIsSafe -and ({definition_matches})
         operation = operation,
         decode_action = windows_task_action_decode_script(&expected_arguments),
     );
-    Ok(powershell_encoded_command(&script))
+    Ok(script)
 }
 
 fn service_path_overrides_observation_command(
@@ -8783,8 +8793,7 @@ mod tests {
         assert!(register.contains(r"'\Satelle\'"));
         assert!(register.contains("'Host-host-123'"));
 
-        let observe = decode_powershell_command(&windows_task_observe_command(&task))
-            .expect("decode task observation");
+        let observe = windows_task_observe_script(&task);
         assert!(observe.contains("Export-ScheduledTask"));
         assert!(observe.contains("InteractiveToken"));
         assert!(observe.contains("LeastPrivilege"));
@@ -8837,10 +8846,20 @@ mod tests {
             RegisteredWindowsTask::new(&host_id, &local_app_data).expect("owned test task");
         let register = decode_powershell_command(&windows_task_register_command(&task))
             .expect("task registration");
-        let observe = decode_powershell_command(
-            &registered_windows_task_command(&registered, "observe").expect("task observer"),
-        )
-        .expect("decode observer");
+        let script_directory = tempfile::tempdir().expect("private task test directory");
+        let observe_path = script_directory.path().join("task-observe.ps1");
+        let observe_script =
+            registered_windows_task_script(&registered, "observe").expect("task observer");
+        std::fs::write(&observe_path, format!("\u{feff}{observe_script}"))
+            .expect("write task observation script");
+        let observe_command = format!(
+            "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"{}\"",
+            observe_path.display()
+        );
+        let observe = format!(
+            "& $env:ComSpec /d /c {}; if ($LASTEXITCODE -ne 0) {{ throw 'Task observation failed.' }}",
+            powershell_quote(&observe_command)
+        );
         let arguments = windows_task_launch_arguments(&task);
         let drifted = decode_powershell_command(&arguments)
             .expect("launch script")
@@ -8881,7 +8900,6 @@ try {{
             task_name = powershell_quote(&task_name),
             drifted_arguments = powershell_quote(&drifted_arguments)
         );
-        let script_directory = tempfile::tempdir().expect("private task test directory");
         let script_path = script_directory.path().join("task-roundtrip.ps1");
         // The combined real-task fixture exceeds Windows' command-line limit.
         // A UTF-8 BOM lets Windows PowerShell read the exact script from disk.
@@ -8915,8 +8933,7 @@ try {{
     #[test]
     fn persistent_service_windows_task_observation_accepts_scheduler_normalized_defaults() {
         let task = persistent_windows_task();
-        let observe = decode_powershell_command(&windows_task_observe_command(&task))
-            .expect("decode task observation");
+        let observe = windows_task_observe_script(&task);
 
         // Task Scheduler omits true/default elements and resolves a trigger
         // SID to its account name when it exports the registered task. The
@@ -8974,10 +8991,8 @@ try {{
         let task =
             RegisteredWindowsTask::new("host-123", r"C:\Users\Satelle Operator\AppData\Local")
                 .expect("canonical registered task identity");
-        let restart = decode_powershell_command(
-            &registered_windows_task_command(&task, "restart").expect("canonical restart command"),
-        )
-        .expect("decode canonical restart");
+        let restart =
+            registered_windows_task_script(&task, "restart").expect("canonical restart script");
         assert!(restart.contains(r"'\Satelle\'"));
         assert!(restart.contains("'Host-host-123'"));
         assert!(restart.contains("WindowsIdentity]::GetCurrent().User.Value"));
@@ -9011,11 +9026,8 @@ try {{
         let observe_task =
             RegisteredWindowsTask::new("host-123", r"C:\Users\operator\AppData\Local")
                 .expect("canonical registered task identity");
-        let observe = decode_powershell_command(
-            &registered_windows_task_command(&observe_task, "observe")
-                .expect("canonical observation command"),
-        )
-        .expect("decode canonical observation");
+        let observe = registered_windows_task_script(&observe_task, "observe")
+            .expect("canonical observation script");
         assert!(observe.contains("Write-Output 'absent'; exit 0"));
         assert!(observe.contains("$task.State -eq 'Running'"));
         assert!(observe.contains("Write-Output 'stopped'"));
