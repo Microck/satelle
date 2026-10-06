@@ -594,6 +594,7 @@ impl SshBootstrapLock {
             .map_err(SshBootstrapError::InspectSsh)?
             .is_some()
         {
+            retire_transport_child(&mut child);
             let _ = stdout_reader.join();
             let classification = stderr_reader.join().unwrap_or_default();
             return Err(if classification.host_key_verification_failed() {
@@ -1238,6 +1239,7 @@ impl SshBootstrapProcess {
             .try_wait()
             .map_err(|error| terminate_child(&mut child, SshBootstrapError::InspectSsh(error)))?;
         if child_status.is_some() {
+            retire_transport_child(&mut child);
             let classification = stderr_reader.join().unwrap_or_default();
             return Err(if classification.host_key_verification_failed() {
                 SshBootstrapError::HostKeyVerificationRequired
