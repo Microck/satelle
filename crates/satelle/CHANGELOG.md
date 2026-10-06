@@ -1,3 +1,9 @@
+## satelle@0.1.38
+
+### Completed setup recovery
+
+Recover an interrupted bootstrap claim after its exact setup or repair run has completed. Verify the original host, operation and claim, preserve the original claim with a recovery receipt, and refuse recovery while external work remains active or unconfirmed.
+
 ## satelle@0.1.37
 
 ### SSH setup recovery
