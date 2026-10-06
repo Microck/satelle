@@ -1,13 +1,16 @@
-use super::{Storage, StorageError, StorageErrorKind, open};
+use super::{
+    SetupActionSkipReason, SetupActionStatus, SetupOperationKind, SetupRunStatus, Storage,
+    StorageError, StorageErrorKind, open,
+};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
-/// Evidence for one exact setup begin with no ledger run, never a lock reset.
+/// Evidence for one exact abandoned or completed setup claim, never a lock reset.
 #[derive(Debug, Serialize)]
-pub struct BootstrapBeginRecovery {
+pub struct BootstrapRecovery {
     pub schema_version: &'static str,
     pub host_identity: String,
     pub operation_id: String,
@@ -24,7 +27,7 @@ pub(crate) fn recover(
     expected_host_identity: &str,
     operation_id: &str,
     apply: bool,
-) -> Result<BootstrapBeginRecovery, StorageError> {
+) -> Result<BootstrapRecovery, StorageError> {
     // Never initialize a new database and mistake it for the original ledger.
     if !Storage::has_existing_state(state_root)? {
         return Err(conflict());
@@ -34,11 +37,44 @@ pub(crate) fn recover(
     // Retention preserves running and outcome-unknown runs. Absence establishes
     // no remaining recovery work, not that a historical transaction never ran.
     let storage = Storage::open_without_restart_recovery(state_root)?;
-    if storage.host_identity()?.as_str() != expected_host_identity
-        || storage.load_setup_run(operation_id)?.is_some()
-    {
+    if storage.host_identity()?.as_str() != expected_host_identity {
         return Err(conflict());
     }
+    let run = storage.load_setup_run(operation_id)?;
+    let completed = if let Some(run) = run.as_ref() {
+        if !matches!(
+            run.operation_kind(),
+            SetupOperationKind::Setup | SetupOperationKind::Repair
+        ) || run.status() != SetupRunStatus::Completed
+            || run.actions().is_empty()
+            || run.actions().iter().any(|action| match action.status() {
+                SetupActionStatus::Completed => false,
+                SetupActionStatus::Skipped => !matches!(
+                    action.skip_reason(),
+                    Some(
+                        SetupActionSkipReason::AlreadySatisfied
+                            | SetupActionSkipReason::NotRequired
+                    )
+                ),
+                _ => true,
+            })
+        {
+            return Err(conflict());
+        }
+        // A completed ledger proves only this setup's mutations. Another lease
+        // may still own external work, so never archive its fence indirectly.
+        let leased: bool = storage.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM maintenance_leases) OR EXISTS(SELECT 1 FROM control_leases)",
+            [],
+            |row| row.get(0),
+        ).map_err(|error| StorageError::with_source(StorageErrorKind::OperationFailed, error))?;
+        if leased {
+            return Err(conflict());
+        }
+        true
+    } else {
+        false
+    };
     let bootstrap_root = open::open_state_root_read_only(bootstrap_state_root)?;
     let lock_root = bootstrap_state_root.join("bootstrap.lock");
     let lock_directory = open::open_state_root_read_only(&lock_root)?;
@@ -72,7 +108,17 @@ pub(crate) fn recover(
             "initial_setup" | "missing_daemon_repair"
         )
         || value("state")? != "recovery_pending"
-        || value("mutation_phase")? != "setup_maintenance_begin"
+        || !matches!(
+            (completed, value("mutation_phase")?),
+            (false, "setup_maintenance_begin")
+                | (
+                    true,
+                    "setup_maintenance_begin"
+                        | "setup_action_start"
+                        | "setup_action_complete"
+                        | "setup_maintenance_finish"
+                )
+        )
         || !hex_identity(identity)
         || !hex_identity(attempt)
         || claim_nonce.is_none_or(|nonce| {
@@ -82,6 +128,14 @@ pub(crate) fn recover(
     {
         return Err(conflict());
     }
+    if run.as_ref().is_some_and(|run| {
+        (run.operation_kind() == SetupOperationKind::Setup
+            && value("operation_kind").ok() != Some("initial_setup"))
+            || (run.operation_kind() == SetupOperationKind::Repair
+                && value("operation_kind").ok() != Some("missing_daemon_repair"))
+    }) {
+        return Err(conflict());
+    }
     let markers = snapshot
         .keys()
         .filter(|name| name.starts_with("execution_"))
@@ -89,13 +143,17 @@ pub(crate) fn recover(
     if markers.len() != 1 || markers[0] != &format!("execution_started.{attempt}") {
         return Err(conflict());
     }
-    let report = BootstrapBeginRecovery {
-        schema_version: "satelle.bootstrap-begin-recovery.v1",
+    let report = BootstrapRecovery {
+        schema_version: "satelle.bootstrap-recovery.v1",
         host_identity: expected_host_identity.to_string(),
         operation_id: operation_id.to_string(),
         claim_identity: identity.to_string(),
         mutation_attempt: attempt.to_string(),
-        outcome: "begin_has_no_ledger_run",
+        outcome: if completed {
+            "setup_run_completed"
+        } else {
+            "begin_has_no_ledger_run"
+        },
         archive_path: bootstrap_state_root
             .join(format!("bootstrap-recovered.{operation_id}.{identity}")),
         changed: apply,
@@ -254,7 +312,53 @@ mod tests {
             }
         }
 
-        fn recover(&self, apply: bool) -> Result<BootstrapBeginRecovery, StorageError> {
+        fn complete_setup(&self, now: OffsetDateTime) {
+            self.finish_setup(now, None);
+        }
+
+        fn finish_setup(&self, now: OffsetDateTime, skip: Option<SetupActionSkipReason>) {
+            let mut storage = Storage::open_without_restart_recovery(&self.state).unwrap();
+            let plan = SetupRunPlan::new(
+                OPERATION,
+                SetupOperationKind::Setup,
+                None,
+                now,
+                vec![SetupActionPlan::new("bootstrap-handoff", "Start Host", true).unwrap()],
+            )
+            .unwrap();
+            let owner = LeaseOwner::new(OPERATION, 123, "process", "boot", now).unwrap();
+            let capability = if skip.is_some() {
+                storage.begin_setup_run(&plan, owner).unwrap()
+            } else {
+                storage.begin_bootstrap_maintenance(&plan, owner).unwrap()
+            };
+            if let Some(reason) = skip {
+                storage
+                    .skip_setup_action(
+                        &capability,
+                        "bootstrap-handoff",
+                        reason,
+                        now + time::Duration::seconds(1),
+                    )
+                    .unwrap();
+            } else {
+                storage
+                    .complete_setup_action_after_verified_postcondition(
+                        &capability,
+                        "bootstrap-handoff",
+                        now + time::Duration::seconds(1),
+                    )
+                    .unwrap();
+            }
+            storage
+                .finish_setup_run_and_release_maintenance(
+                    &capability,
+                    now + time::Duration::seconds(2),
+                )
+                .unwrap();
+        }
+
+        fn recover(&self, apply: bool) -> Result<BootstrapRecovery, StorageError> {
             recover(
                 &self.state,
                 &self.bootstrap,
@@ -310,6 +414,57 @@ mod tests {
     }
 
     #[test]
+    fn completed_setup_archives_only_its_ledger_phase_and_preserves_the_run() {
+        for phase in ["setup_action_complete", "service_start"] {
+            let fixture = Fixture::new();
+            fixture.complete_setup(OffsetDateTime::now_utc());
+            let directory = open::open_state_root_read_only(&fixture.claim).unwrap();
+            directory
+                .delete_private_leaf_durable("mutation_phase")
+                .unwrap();
+            directory
+                .create_private_leaf_durable("mutation_phase", phase.as_bytes())
+                .unwrap();
+            drop(directory);
+            if phase == "service_start" {
+                assert!(fixture.recover(true).is_err());
+                assert!(fixture.claim.is_dir());
+                continue;
+            }
+            let preview = fixture.recover(false).unwrap();
+            assert_eq!(preview.outcome, "setup_run_completed");
+            assert!(!preview.changed);
+            let recovered = fixture.recover(true).unwrap();
+            assert!(recovered.archive_path.is_dir());
+            assert!(!fixture.claim.exists());
+            let storage = Storage::open_without_restart_recovery(&fixture.state).unwrap();
+            assert_eq!(
+                storage.load_setup_run(OPERATION).unwrap().unwrap().status(),
+                SetupRunStatus::Completed
+            );
+        }
+    }
+
+    #[test]
+    fn safe_skips_recover_but_dependency_failure_stays_fenced() {
+        for reason in [
+            SetupActionSkipReason::AlreadySatisfied,
+            SetupActionSkipReason::NotRequired,
+            SetupActionSkipReason::DependencyFailed,
+        ] {
+            let fixture = Fixture::new();
+            fixture.finish_setup(OffsetDateTime::now_utc(), Some(reason));
+            if reason == SetupActionSkipReason::DependencyFailed {
+                assert!(fixture.recover(true).is_err());
+                assert!(fixture.claim.is_dir());
+            } else {
+                assert!(fixture.recover(true).unwrap().changed);
+                assert!(!fixture.claim.exists());
+            }
+        }
+    }
+
+    #[test]
     fn foreign_empty_or_retiring_claim_names_keep_the_claim_fenced() {
         for basename in [
             "claim.another-operation.fhgc9G",
@@ -346,6 +501,27 @@ mod tests {
         assert!(fixture.claim.is_dir());
         let storage = Storage::open_without_restart_recovery(&fixture.state).unwrap();
         assert!(storage.load_setup_run(OPERATION).unwrap().is_some());
+    }
+
+    #[test]
+    fn completed_setup_does_not_retire_another_maintenance_owner() {
+        let fixture = Fixture::new();
+        let now = OffsetDateTime::now_utc();
+        fixture.complete_setup(now);
+        let mut storage = Storage::open_without_restart_recovery(&fixture.state).unwrap();
+        let another = SetupRunPlan::new(
+            "another-setup",
+            SetupOperationKind::Setup,
+            None,
+            now,
+            vec![SetupActionPlan::new("service-config", "Configure Host", true).unwrap()],
+        )
+        .unwrap();
+        let owner = LeaseOwner::new("another-setup", 456, "other-process", "boot", now).unwrap();
+        storage.begin_setup_run(&another, owner).unwrap();
+        drop(storage);
+        assert!(fixture.recover(true).is_err());
+        assert!(fixture.claim.is_dir());
     }
 
     #[test]

@@ -708,9 +708,9 @@ struct PathsCommand {
 #[derive(Subcommand, Debug)]
 enum HostCommand {
     Start(Box<HostStartCommand>),
-    /// Internal owner-local reconciliation of a setup begin with no ledger run.
+    /// Internal owner-local reconciliation of an abandoned or completed setup claim.
     #[command(hide = true)]
-    RecoverBootstrapBegin(RecoverBootstrapBeginCommand),
+    RecoverBootstrap(RecoverBootstrapCommand),
     /// Internal owner-local request for a running SSH daemon to release its store.
     #[command(hide = true)]
     ReleaseState,
@@ -749,7 +749,7 @@ enum HostCommand {
 
 #[derive(Args, Debug)]
 #[group(required = true, multiple = false, args = ["dry_run", "yes"])]
-struct RecoverBootstrapBeginCommand {
+struct RecoverBootstrapCommand {
     #[arg(long)]
     state_root: PathBuf,
     #[arg(long)]
@@ -3243,7 +3243,7 @@ fn history_target(command: &Command) -> Option<HistoryTarget<'_>> {
             command: HostCommand::ReleaseState,
         } => return None,
         Command::Host {
-            command: HostCommand::RecoverBootstrapBegin(_),
+            command: HostCommand::RecoverBootstrap(_),
         } => return None,
         Command::Host {
             command: HostCommand::Start(command),
@@ -3275,7 +3275,7 @@ fn history_target(command: &Command) -> Option<HistoryTarget<'_>> {
             explicit_host: match command {
                 HostCommand::Start(_) => None,
                 HostCommand::ReleaseState => None,
-                HostCommand::RecoverBootstrapBegin(_) => None,
+                HostCommand::RecoverBootstrap(_) => None,
                 HostCommand::Trust(command) => Some(command.host.as_str()),
                 HostCommand::Status(command) => command.host.as_deref(),
                 HostCommand::Stop(command) | HostCommand::Restart(command) => {
@@ -9915,8 +9915,8 @@ fn run_host(
     match command {
         HostCommand::Start(command) => start_host_daemon(*command, config, format),
         HostCommand::ReleaseState => release_ssh_state_owner(),
-        HostCommand::RecoverBootstrapBegin(command) => {
-            let report = satelle::host::HostService::recover_bootstrap_begin_without_run(
+        HostCommand::RecoverBootstrap(command) => {
+            let report = satelle::host::HostService::recover_bootstrap_claim(
                 &command.state_root,
                 &command.bootstrap_state_root,
                 &command.expected_host_id,
