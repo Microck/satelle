@@ -1529,6 +1529,10 @@
 - an orphaned Maintenance Lease operation is classified outcome_unknown and reconciled from its action postconditions before retry or release @spec @mvp @implemented
 - lease expiry alone never proves that an external Computer Use or maintenance side effect stopped @spec @mvp @implemented
 - timeout expiry, a cancellation request, transport loss, adapter failure, or lease expiry never by itself proves that an upstream Computer Use execution stopped and never by itself permits Control Lease release @spec @mvp @implemented
+- Unix Controller SSH and SFTP helpers own an isolated local process group; retiring a helper ends its jump processes before joining output readers, including when the SSH leader has already exited, without proving remote operation completion or releasing remote recovery claims @spec @contract @mvp @implemented
+- label: transport retirement closes inherited descendant pipes for live and already-exited leaders
+  command: cargo test --locked -p satelle --all-features --bin satelle transport::ssh_tunnel::tests::transport_retirement_closes_descendant_pipes_after_leader_exit -- --exact
+  tags: [spec, contract, mvp, implemented, ci]
 - initial setup, missing-daemon repair, and Host binary replacement acquire a Bootstrap Lock before mutating remote files or starting a replacement Host Daemon @spec @mvp @implemented
 - a Bootstrap Lock uses atomic filesystem creation under the remote OS user's Satelle state boundary @spec @mvp @implemented
 - a Bootstrap Lock records a non-secret operation id, Controller identity when known, acquisition time, and heartbeat time @spec @mvp @implemented
