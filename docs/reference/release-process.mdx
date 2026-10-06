@@ -73,6 +73,8 @@ failure stops publication.
 
 ## Release pull request
 
+Pull request and signed-tag release validation both check that the committed Tegami changelog describes the candidate version. A missing entry fails validation before publication.
+
 The release pull request must contain one reviewed version everywhere the
 release contract requires it: the Cargo package, all eight npm package
 manifests, exact launcher dependency ranges, lockfiles, and Tegami changelog

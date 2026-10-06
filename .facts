@@ -2449,6 +2449,7 @@
 - satelle ordinary public release flow starts with a release pull request before any public package or binary publishing occurs @spec @mvp @implemented
 - satelle release pull request updates version metadata, Tegami changelog output, package lockfiles, generated package manifests, and release configuration needed for the target version @spec @mvp @implemented
 - satelle release pull request verification builds and validates release candidate artifacts without publishing public npm packages or final GitHub release assets @spec @mvp @implemented
+- satelle release candidate validation verifies committed Tegami changelog output against the candidate version on pull requests as well as signed tags before publishing @spec @release-gate @verification @implemented
 - satelle public publish workflow is triggered by pushing a protected version tag matching vX.Y.Z after the release pull request has merged to the default branch @spec @mvp @implemented
 - satelle public publish workflow does not run from release pull request merge alone @spec @mvp @implemented
 - satelle public publish workflow verifies that the version tag, committed version metadata, Tegami changelog output, npm package metadata, native artifact metadata, and integrity metadata all describe the same version before publishing @spec @mvp @implemented
