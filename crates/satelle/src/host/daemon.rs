@@ -2270,7 +2270,7 @@ impl HostService {
     }
 
     #[doc(hidden)]
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn with_adapter_for_tests_at<A: crate::host::ComputerUseAdapter>(
         state_root: impl Into<std::path::PathBuf>,
         adapter: A,

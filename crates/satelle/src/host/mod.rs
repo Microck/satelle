@@ -7890,7 +7890,7 @@ pub fn local_setup_plan(
 }
 
 #[doc(hidden)]
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 pub fn local_setup_plan_for_tests(
     host: &str,
     dry_run: bool,
