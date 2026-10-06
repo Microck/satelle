@@ -247,7 +247,16 @@ fn failure(error: &SatelleError) -> ApiFailure {
                 (!action.is_empty()
                     && action.len() <= 64
                     && action.bytes().all(|byte| byte.is_ascii_lowercase() || byte == b'-'))
-                .then(|| serde_json::json!({ "failed_action": action, "changed": changed }))
+                .then(|| {
+                    let mut details = serde_json::json!({ "failed_action": action, "changed": changed });
+                    if action == "extract-codex-package"
+                        && !changed
+                        && error.details.get("storage_reason") == Some(&serde_json::json!("disk_full"))
+                    {
+                        details["storage_reason"] = serde_json::json!("disk_full");
+                    }
+                    details
+                })
             }),
         },
         ErrorCode::SetupLedgerUnavailable => ApiFailure {
@@ -904,6 +913,31 @@ mod tests {
             Some(json!({"failed_action": "prepare-package-root", "changed": false}))
         );
         assert!(!mapped.message.contains("PRIVATE"));
+        error
+            .details
+            .insert("failed_action".to_string(), json!("extract-codex-package"));
+        error
+            .details
+            .insert("storage_reason".to_string(), json!("disk_full"));
+        assert_eq!(
+            failure(&error).details,
+            Some(json!({
+                "failed_action": "extract-codex-package", "changed": false, "storage_reason": "disk_full"
+            }))
+        );
+        error
+            .details
+            .insert("storage_reason".to_string(), json!("PRIVATE_REASON"));
+        assert_eq!(
+            failure(&error).details,
+            Some(json!({
+                "failed_action": "extract-codex-package", "changed": false
+            }))
+        );
+        error.details.remove("storage_reason");
+        error
+            .details
+            .insert("failed_action".to_string(), json!("prepare-package-root"));
         error.details.insert("changed".to_string(), json!(true));
         assert_eq!(
             failure(&error).details,

@@ -9716,7 +9716,12 @@ fn map_managed_setup_api_error(
         mapped.message = "the Host could not complete the managed setup action".to_string();
         // Keep the public step, never the upstream message or source diagnostics.
         if let Some(details) = error.details().and_then(serde_json::Value::as_object)
-            && details.len() == 2
+            && (details.len() == 2
+                || (details.len() == 3
+                    && details.get("storage_reason") == Some(&serde_json::json!("disk_full"))
+                    && details.get("failed_action")
+                        == Some(&serde_json::json!("extract-codex-package"))
+                    && details.get("changed") == Some(&serde_json::json!(false))))
             && let Some(action) = details
                 .get("failed_action")
                 .and_then(serde_json::Value::as_str)
@@ -9732,6 +9737,12 @@ fn map_managed_setup_api_error(
                 .insert("failed_action".to_string(), action.into());
             mapped.details.insert("changed".to_string(), changed.into());
             mapped.message = format!("managed setup step '{action}' failed on the Host");
+            if details.get("storage_reason") == Some(&serde_json::json!("disk_full")) {
+                mapped
+                    .details
+                    .insert("storage_reason".to_string(), "disk_full".into());
+                mapped.message = "Codex installation ran out of disk space. Free disk space on the Host installation drive and repeat the same setup command.".to_string();
+            }
         }
     }
     mapped
