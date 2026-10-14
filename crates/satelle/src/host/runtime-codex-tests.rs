@@ -3,6 +3,8 @@ use super::control_plane::MacosNativeSessionResources;
 use super::control_plane::macos_native_runtime_version;
 #[cfg(unix)]
 use super::control_plane::perform_handshake;
+use super::control_plane::validate_windows_codex_app_layout;
+use super::control_plane::windows_native_runtime_version;
 use super::control_plane::{
     CodexImageInputMode, ControlPlaneAdmission, NATIVE_ISOLATION_TIMEOUT, NativeMcpBinding,
     PROBE_TIMEOUT, PlannedNativeComputerUseActionPath, bounded_inventory_command_output,
@@ -321,6 +323,10 @@ fn windows_native_bridge_env() -> BTreeMap<String, String> {
 fn expected_windows_native_binding_env() -> BTreeMap<String, String> {
     let reported = windows_native_bridge_env();
     BTreeMap::from([
+        (
+            "CODEX_CLI_PATH".to_string(),
+            reported["CODEX_CLI_PATH"].clone(),
+        ),
         (
             "NODE_REPL_UNTRUSTED_ENV_ALLOWLIST".to_string(),
             "CODEX_WINDOWS_REGISTERED_CORE".to_string(),
@@ -2037,6 +2043,155 @@ fn macos_codex_app_layout_rejects_redirected_cli_identity() {
         error.details["reason"],
         json!("codex_app_runtime_untrusted")
     );
+}
+
+#[test]
+fn windows_desktop_cli_layout_rejects_missing_and_redirected_components() {
+    let directory = tempfile::tempdir().expect("create Windows desktop CLI fixture");
+    let root = directory.path().join("OpenAI.Codex");
+    let resources = root.join("app").join("resources");
+    std::fs::create_dir_all(&resources).expect("create package layout");
+    let binary = resources.join("codex.exe");
+    std::fs::write(&binary, "official fixture").expect("write CLI fixture");
+    assert_eq!(
+        validate_windows_codex_app_layout(&root).expect("admit regular desktop layout"),
+        std::fs::canonicalize(&binary).expect("canonical CLI path")
+    );
+    let canonical_root = std::fs::canonicalize(&root).expect("canonical package root");
+    assert_eq!(
+        validate_windows_codex_app_layout(&canonical_root)
+            .expect("admit canonical Windows verbatim package path"),
+        std::fs::canonicalize(&binary).expect("canonical CLI path")
+    );
+    let file = File::options()
+        .write(true)
+        .open(&binary)
+        .expect("open CLI fixture");
+    file.set_len(310 * 1024 * 1024)
+        .expect("set current desktop CLI size");
+    assert!(validate_windows_codex_app_layout(&root).is_ok());
+    file.set_len(512 * 1024 * 1024 + 1)
+        .expect("exceed bounded CLI size");
+    let oversized = validate_windows_codex_app_layout(&root).expect_err("reject oversized CLI");
+    assert_eq!(
+        oversized.details["reason"],
+        json!("codex_app_runtime_untrusted")
+    );
+    drop(file);
+    std::fs::remove_file(&binary).expect("remove fixture CLI");
+    let missing = validate_windows_codex_app_layout(&root).expect_err("reject missing CLI");
+    assert_eq!(
+        missing.details["reason"],
+        json!("codex_app_runtime_missing")
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+        let replacement = directory.path().join("replacement.exe");
+        std::fs::write(&replacement, "unrelated fixture").expect("write redirected CLI");
+        symlink(&replacement, &binary).expect("redirect CLI");
+        let redirected =
+            validate_windows_codex_app_layout(&root).expect_err("reject redirected CLI");
+        assert_eq!(
+            redirected.details["reason"],
+            json!("codex_app_runtime_untrusted")
+        );
+        std::fs::remove_file(&binary).expect("remove redirected CLI");
+        std::fs::remove_dir(&resources).expect("remove empty resources");
+        let external = directory.path().join("external-resources");
+        std::fs::create_dir(&external).expect("create redirected directory");
+        symlink(&external, &resources).expect("redirect resources");
+        let redirected =
+            validate_windows_codex_app_layout(&root).expect_err("reject redirected resources");
+        assert_eq!(
+            redirected.details["reason"],
+            json!("codex_app_runtime_untrusted")
+        );
+    }
+}
+
+#[test]
+fn windows_native_cli_inventory_rejects_paths_outside_the_official_cache() {
+    let command = Path::new(
+        r"C:\Users\operator\AppData\Local\OpenAI\Codex\runtimes\cua_node\f1359d6e9a17bb1d\bin\node_repl.exe",
+    );
+    let codex_home = Path::new(r"C:\Users\operator\.codex");
+    for binary in [
+        r"C:\Users\other\AppData\Local\OpenAI\Codex\bin\a61afac3bb4ee395\codex.exe",
+        r"C:\Users\operator\AppData\Local\OpenAI\Codex\bin\short\codex.exe",
+        r"C:\Users\operator\AppData\Local\OpenAI\Codex\bin\a61afac3bb4ee395\other.exe",
+        r"C:\Users\operator\AppData\Local\OpenAI\Codex\bin\a61afac3bb4ee395\..\codex.exe",
+        r"\\server\Codex\bin\a61afac3bb4ee395\codex.exe",
+    ] {
+        let mut env = windows_native_bridge_env();
+        env.insert("CODEX_CLI_PATH".to_string(), binary.to_string());
+        assert!(trusted_windows_node_repl_env(&env, command, codex_home).is_none());
+    }
+    let mut env = windows_native_bridge_env();
+    env.remove("CODEX_CLI_PATH");
+    assert!(trusted_windows_node_repl_env(&env, command, codex_home).is_none());
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_desktop_cli_lock_authenticates_and_prevents_replacement() {
+    use super::control_plane::lock_windows_desktop_cli;
+    use sha2::{Digest, Sha256};
+
+    let directory = tempfile::tempdir().expect("create desktop CLI cache fixture");
+    // CI exposes TEMP through a DOS alias; admitted cache paths are canonical.
+    let binary = std::fs::canonicalize(directory.path())
+        .expect("resolve desktop CLI cache fixture")
+        .join("codex.exe");
+    let bytes = b"current protected desktop CLI";
+    std::fs::write(&binary, bytes).expect("write extracted CLI fixture");
+    let canonical = std::fs::canonicalize(&binary).expect("resolve extracted CLI fixture");
+    assert!(
+        same_path_for_platform(&canonical, &binary, "windows"),
+        "CLI fixture must use the admitted canonical cache path: {binary:?} -> {canonical:?}"
+    );
+    assert!(lock_windows_desktop_cli(&binary, &[0; 32]).is_err());
+    let digest: [u8; 32] = Sha256::digest(bytes).into();
+    let lock = lock_windows_desktop_cli(&binary, &digest).expect("authenticate extracted CLI");
+    assert!(File::options().write(true).open(&binary).is_err());
+    assert!(std::fs::remove_file(&binary).is_err());
+    assert_eq!(std::fs::read(&binary).expect("read locked CLI"), bytes);
+    drop(lock);
+    std::fs::remove_file(&binary).expect("release cached CLI lock with session resources");
+}
+
+#[test]
+fn native_binary_hash_failures_identify_the_authenticated_component() {
+    use super::control_plane::native_binary_digest;
+    use sha2::{Digest, Sha256};
+
+    let directory = tempfile::tempdir().expect("create authenticated binary fixture");
+    let binary = directory.path().join("binary");
+    for reason in ["native_bridge_untrusted", "codex_app_runtime_untrusted"] {
+        let missing = native_binary_digest(&binary, 4, reason).expect_err("reject missing image");
+        assert_eq!(missing.details["reason"], json!(reason));
+    }
+    std::fs::write(&binary, b"image").expect("write authenticated binary fixture");
+    for reason in ["native_bridge_untrusted", "codex_app_runtime_untrusted"] {
+        let oversized =
+            native_binary_digest(&binary, 4, reason).expect_err("reject oversized image");
+        assert_eq!(oversized.details["reason"], json!(reason));
+    }
+    let expected: [u8; 32] = Sha256::digest(b"image").into();
+    assert_eq!(
+        native_binary_digest(&binary, 5, "native_bridge_untrusted").expect("hash bounded image"),
+        expected
+    );
+}
+
+#[test]
+fn windows_readiness_identity_invalidates_when_the_desktop_cli_changes() {
+    let identity = windows_native_runtime_version(&[1; 32], &[2; 32]);
+    assert_eq!(identity, windows_native_runtime_version(&[1; 32], &[2; 32]));
+    assert_ne!(identity, windows_native_runtime_version(&[1; 32], &[3; 32]));
+    assert_ne!(identity, windows_native_runtime_version(&[3; 32], &[2; 32]));
+    assert!(identity.starts_with("sha256-"));
+    assert_eq!(identity.len(), 71);
 }
 
 #[test]

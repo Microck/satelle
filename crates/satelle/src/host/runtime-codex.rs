@@ -63,6 +63,9 @@ const CODEX_PACKAGE_MARKETPLACE: &str = "app/resources/plugins/openai-bundled";
 const NATIVE_BRIDGE_FILE_LIMIT: u64 = 64 * 1024 * 1024;
 #[cfg(target_os = "macos")]
 const MACOS_NATIVE_LAUNCHER_FILE_LIMIT: u64 = 256 * 1024 * 1024;
+// The current protected Windows desktop CLI is larger than the Mac launcher.
+#[cfg(any(windows, all(test, unix)))]
+const WINDOWS_NATIVE_CLI_FILE_LIMIT: u64 = 512 * 1024 * 1024;
 #[cfg(any(target_os = "macos", all(test, unix)))]
 const MACOS_SERVICE_INFO_LIMIT: u64 = 1024 * 1024;
 const WINDOWS_LOCKED_BRIDGE_SCRIPT: &str = r#"& { param([string]$bridge,[string]$expected) $ErrorActionPreference='Stop'; if ([string]::IsNullOrEmpty($bridge) -or [string]::IsNullOrEmpty($expected)) { exit 64 }; $stream=$null; $child=$null; try { $stream=[System.IO.File]::Open($bridge,[System.IO.FileMode]::Open,[System.IO.FileAccess]::Read,[System.IO.FileShare]::Read); $sha=[System.Security.Cryptography.SHA256]::Create(); try { $actual=([System.BitConverter]::ToString($sha.ComputeHash($stream))).Replace('-','') } finally { $sha.Dispose() }; if (-not $actual.Equals($expected,[System.StringComparison]::OrdinalIgnoreCase)) { exit 74 }; $start=New-Object System.Diagnostics.ProcessStartInfo; $start.FileName=$bridge; $start.UseShellExecute=$false; $child=[System.Diagnostics.Process]::Start($start); if ($null -eq $child) { exit 74 } } catch { exit 74 } finally { if ($null -ne $stream) { $stream.Dispose() } }; $child.WaitForExit(); exit $child.ExitCode }"#;
@@ -477,6 +480,17 @@ fn verified_computer_use_app_server_with_commands(
         .native_mcp_binding
         .args
         .splice(0..0, prepared_native_bridge.prefix_args);
+    #[cfg(windows)]
+    let app_server_command = {
+        // The authenticated desktop CLI supplies the native execution core. The
+        // managed CLI remains the current installation and inventory runtime.
+        drop(app_server_command);
+        let binary = &isolation.native_mcp_binding.env["CODEX_CLI_PATH"];
+        let mut command = Command::new(binary);
+        command.env("CODEX_HOME", runtime.codex_home());
+        command.env("CODEX_CLI_PATH", binary);
+        command
+    };
     let native_action_path = match isolation.planned_native_action_path {
         PlannedNativeComputerUseActionPath::WindowsNodeRepl => {
             NativeComputerUseActionPath::WindowsNodeRepl
@@ -1720,7 +1734,33 @@ fn prepare_native_bridge(
             // holds the checked cache file against writes and replacement
             // until Windows has opened the child image.
             let inventory_digest = native_bridge_digest(path)?;
-            protected_windows_native_bridge(&inventory_digest)?;
+            let protected_bridge = protected_windows_native_bridge(&inventory_digest)?;
+            #[cfg(windows)]
+            let (native_runtime_version, desktop_cli_lock) = {
+                // Select the CLI from the same protected package that admitted
+                // this bridge, rather than a mutable cache or a version pin.
+                let package_root = protected_bridge
+                    .ancestors()
+                    .nth(Path::new(CODEX_PACKAGE_NODE_REPL).components().count())
+                    .ok_or_else(|| codex_isolation_error("codex_app_runtime_untrusted"))?;
+                let protected_binary = validate_windows_codex_app_layout(package_root)?;
+                let codex_digest = native_binary_digest(
+                    &protected_binary,
+                    WINDOWS_NATIVE_CLI_FILE_LIMIT,
+                    "codex_app_runtime_untrusted",
+                )?;
+                let binary = Path::new(&native_env["CODEX_CLI_PATH"]);
+                let lock = lock_windows_desktop_cli(binary, &codex_digest)?;
+                (
+                    windows_native_runtime_version(&inventory_digest, &codex_digest),
+                    lock,
+                )
+            };
+            #[cfg(not(windows))]
+            let native_runtime_version = {
+                let _ = protected_bridge;
+                format!("sha256-{}", hex_digest(&inventory_digest))
+            };
             #[cfg(windows)]
             let native_resources = {
                 let staging = windows_native_staging::WindowsNativeStaging::create().map_err(|_| {
@@ -1737,6 +1777,7 @@ fn prepare_native_bridge(
                 }
                 NativeSessionResources {
                     _windows: Some(staging),
+                    _windows_cli: Some(desktop_cli_lock),
                 }
             };
             #[cfg(not(windows))]
@@ -1744,7 +1785,7 @@ fn prepare_native_bridge(
             Ok(PreparedNativeBridge {
                 command: windows_powershell_path()?.to_string_lossy().into_owned(),
                 prefix_args: windows_locked_bridge_args(path, &inventory_digest),
-                native_runtime_version: format!("sha256-{}", hex_digest(&inventory_digest)),
+                native_runtime_version,
                 native_resources,
             })
         }
@@ -1789,6 +1830,8 @@ struct PreparedNativeBridge {
 pub(crate) struct NativeSessionResources {
     #[cfg(windows)]
     _windows: Option<windows_native_staging::WindowsNativeStaging>,
+    #[cfg(windows)]
+    _windows_cli: Option<File>,
     #[cfg(target_os = "macos")]
     _macos: Option<MacosNativeSessionResources>,
 }
@@ -1801,6 +1844,7 @@ impl NativeSessionResources {
         (
             Self {
                 _windows: Some(staging),
+                _windows_cli: None,
             },
             path,
         )
@@ -1810,6 +1854,8 @@ impl NativeSessionResources {
         Self {
             #[cfg(windows)]
             _windows: None,
+            #[cfg(windows)]
+            _windows_cli: None,
             #[cfg(target_os = "macos")]
             _macos: None,
         }
@@ -2089,16 +2135,120 @@ pub(super) fn native_bridge_digest(path: &Path) -> Result<[u8; 32], SatelleError
     {
         return Err(codex_isolation_error("native_bridge_untrusted"));
     }
-    let mut bytes = Vec::new();
-    File::open(path)
-        .map_err(|_| codex_isolation_error("native_bridge_untrusted"))?
-        .take(NATIVE_BRIDGE_FILE_LIMIT + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| codex_isolation_error("native_bridge_untrusted"))?;
-    if bytes.len() > NATIVE_BRIDGE_FILE_LIMIT as usize {
-        return Err(codex_isolation_error("native_bridge_untrusted"));
+    native_binary_digest(path, NATIVE_BRIDGE_FILE_LIMIT, "native_bridge_untrusted")
+}
+
+// The caller admits the regular file and size limit at its trust boundary.
+// Bound the read too, so a mutable bridge cannot grow beyond that limit.
+pub(super) fn native_binary_digest(
+    path: &Path,
+    size_limit: u64,
+    untrusted_reason: &'static str,
+) -> Result<[u8; 32], SatelleError> {
+    let mut reader = File::open(path)
+        .map_err(|_| codex_isolation_error(untrusted_reason))?
+        .take(size_limit + 1);
+    let mut digest = Sha256::new();
+    let mut total = 0_u64;
+    // Desktop CLIs can exceed 300 MiB; hashing must not retain the whole image.
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let length = match reader.read(&mut buffer) {
+            Ok(length) => length,
+            // Preserve read_to_end's interrupted-read behavior when streaming.
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return Err(codex_isolation_error(untrusted_reason)),
+        };
+        if length == 0 {
+            break;
+        }
+        total += length as u64;
+        if total > size_limit {
+            return Err(codex_isolation_error(untrusted_reason));
+        }
+        digest.update(&buffer[..length]);
     }
-    Ok(Sha256::digest(bytes).into())
+    Ok(digest.finalize().into())
+}
+
+#[cfg(any(windows, all(test, unix)))]
+pub(super) fn validate_windows_codex_app_layout(
+    package_root: &Path,
+) -> Result<PathBuf, SatelleError> {
+    let resources = package_root.join("app").join("resources");
+    for directory in [package_root, &package_root.join("app"), &resources] {
+        let metadata = fs::symlink_metadata(directory)
+            .map_err(|_| codex_isolation_error("codex_app_runtime_missing"))?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(codex_isolation_error("codex_app_runtime_untrusted"));
+        }
+    }
+    let binary = resources.join("codex.exe");
+    let metadata = fs::symlink_metadata(&binary)
+        .map_err(|_| codex_isolation_error("codex_app_runtime_missing"))?;
+    let canonical = fs::canonicalize(&binary)
+        .map_err(|_| codex_isolation_error("codex_app_runtime_untrusted"))?;
+    let canonical_root = fs::canonicalize(package_root)
+        .map_err(|_| codex_isolation_error("codex_app_runtime_untrusted"))?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() > WINDOWS_NATIVE_CLI_FILE_LIMIT
+        || canonical
+            != canonical_root
+                .join("app")
+                .join("resources")
+                .join("codex.exe")
+    {
+        return Err(codex_isolation_error("codex_app_runtime_untrusted"));
+    }
+    Ok(canonical)
+}
+
+#[cfg(any(windows, test))]
+pub(super) fn windows_native_runtime_version(
+    bridge_digest: &[u8; 32],
+    codex_digest: &[u8; 32],
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"satelle-windows-native-runtime-v1\0");
+    digest.update(bridge_digest);
+    digest.update(codex_digest);
+    format!("sha256-{}", hex_digest(&digest.finalize().into()))
+}
+
+#[cfg(windows)]
+pub(super) fn lock_windows_desktop_cli(
+    binary: &Path,
+    protected_digest: &[u8; 32],
+) -> Result<File, SatelleError> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+
+    // Keep the official extracted image readable but not writable or replaceable.
+    // The protected AppX executable authenticates it; AppX ACLs prevent launching
+    // that protected copy directly from the Host process.
+    let lock = File::options()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .open(binary)
+        .map_err(|_| codex_isolation_error("codex_app_runtime_untrusted"))?;
+    let metadata = fs::symlink_metadata(binary)
+        .map_err(|_| codex_isolation_error("codex_app_runtime_untrusted"))?;
+    let canonical = fs::canonicalize(binary)
+        .map_err(|_| codex_isolation_error("codex_app_runtime_untrusted"))?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() > WINDOWS_NATIVE_CLI_FILE_LIMIT
+        || !same_path_for_platform(&canonical, binary, "windows")
+        || native_binary_digest(
+            binary,
+            WINDOWS_NATIVE_CLI_FILE_LIMIT,
+            "codex_app_runtime_untrusted",
+        )? != *protected_digest
+    {
+        return Err(codex_isolation_error("codex_app_runtime_untrusted"));
+    }
+    Ok(lock)
 }
 
 #[cfg(windows)]
@@ -3112,6 +3262,10 @@ pub(super) fn trusted_windows_node_repl_env(
     let trusted_code_paths =
         trusted_windows_node_repl_code_paths(reported_env, command, codex_home)?;
     let (node_modules, node) = windows_node_repl_runtime_paths(command)?;
+    let desktop_cli = reported_env.get("CODEX_CLI_PATH")?;
+    if !trusted_windows_desktop_cli_path(Path::new(desktop_cli), command) {
+        return None;
+    }
     // Inventory capabilities are a set; only the isolated Sky runtime's
     // admitted backends are forwarded below, regardless of desktop ordering.
     let backends = reported_env.get("BROWSER_USE_AVAILABLE_BACKENDS")?;
@@ -3168,6 +3322,7 @@ pub(super) fn trusted_windows_node_repl_env(
     }
 
     Some(BTreeMap::from([
+        ("CODEX_CLI_PATH".to_string(), desktop_cli.clone()),
         (
             "NODE_REPL_UNTRUSTED_ENV_ALLOWLIST".to_string(),
             "CODEX_WINDOWS_REGISTERED_CORE".to_string(),
@@ -3203,6 +3358,30 @@ pub(super) fn trusted_windows_node_repl_env(
             r#"{"sky":"@oai/sky/service"}"#.to_string(),
         ),
     ]))
+}
+
+fn trusted_windows_desktop_cli_path(binary: &Path, bridge: &Path) -> bool {
+    let Some(binary) = normalized_windows_drive_path(binary) else {
+        return false;
+    };
+    let Some(bridge) = normalized_windows_drive_path(bridge) else {
+        return false;
+    };
+    let binary = binary.to_ascii_lowercase();
+    let bridge = bridge.to_ascii_lowercase();
+    let Some((root, _)) = bridge.rsplit_once("/runtimes/cua_node/") else {
+        return false;
+    };
+    let prefix = format!("{root}/bin/");
+    let Some(suffix) = binary.strip_prefix(&prefix) else {
+        return false;
+    };
+    let Some((identity, name)) = suffix.split_once('/') else {
+        return false;
+    };
+    identity.len() == 16
+        && identity.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && name == "codex.exe"
 }
 
 fn windows_node_repl_code_paths(command: &Path, codex_home: &Path) -> Option<String> {

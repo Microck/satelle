@@ -101,6 +101,19 @@ so the official provider can forward its registered core to native execution.
 Satelle does not read, store, or export the opaque core value, and rejects
 missing declarations or additional inherited environment names.
 
+Windows native Computer Use also uses the Codex app-server embedded in the
+current registered desktop package. Satelle admits the latest managed CLI for
+installation and inventory, authenticates the bridge against that protected
+AppX package, then launches the desktop's official extracted CLI with the same
+managed home. Windows does not allow direct execution from the protected package.
+The extracted CLI must match the protected executable byte for byte and remains
+locked against writes and replacement while the native session owns it.
+The native helper receives that authenticated `CODEX_CLI_PATH`. A standalone CLI
+does not supply the desktop's native execution core. Satelle does not substitute
+an older installed package or pin the managed CLI. Missing or redirected desktop
+components fail admission. Both bridge and bundled app-server hashes bind the
+Windows readiness identity, so a desktop runtime update requires fresh proof.
+
 Codex Desktop and bundled Computer Use component versions are evidence and
 cache identity, not admission pins. Satelle authenticates the platform package
 or OpenAI signing identity, validates bundled provenance and bridge shape, and
