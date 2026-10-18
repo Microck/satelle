@@ -1,6 +1,6 @@
 core:changelogs:
-  - content: "---\npackages:\n  cargo:satelle:\n    type: patch\n---\n\n## Completed setup recovery\n\nRecover an interrupted bootstrap claim after its exact setup or repair run has completed. Verify the original host, operation and claim, preserve the original claim with a recovery receipt, and refuse recovery while external work remains active or unconfirmed.\n"
-    filename: completed-setup-claim-recovery.md
+  - content: "---\npackages:\n  cargo:satelle:\n    type: patch\n---\n\n## Current macOS Computer Use runtime\n\nUse the signed CLI in the current ChatGPT desktop bundle. Accept official backend capabilities and independently versioned browser cache paths while keeping native execution limited to Sky. Publisher verification, app consent and redirected-path checks remain enforced.\n"
+    filename: current-macos-native-runtime.md
     v: 0.0.0
 core:packages:
   - id: npm:satelle-repository
@@ -8,7 +8,7 @@ core:packages:
   - id: npm:satelle-docs
     updated: false
   - changelogIds:
-      - completed-setup-claim-recovery.md
+      - current-macos-native-runtime.md
     id: cargo:satelle
     updated: true
 npm:packages:
