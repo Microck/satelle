@@ -84,16 +84,22 @@ never marks a release as compatible. A removed or changed required capability
 produces the same typed blocker on any newer release.
 
 On macOS, native Computer Use uses the OpenAI-signed Codex CLI embedded in the
-same `/Applications/ChatGPT.app` bundle as `node_repl`. The signed Computer Use
+same `/Applications/ChatGPT.app` bundle as `node_repl`. Its canonical executable
+is `Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex`, a signed
+Mach-O binary. The adjacent `codex-cli/bin/codex` shell wrapper and historical
+flat CLI layout are not admitted. The signed Computer Use
 service authenticates that process ancestry as one desktop release family and
 rejects a bridge parented by a separate standalone Codex release. Satelle keeps
 its managed `CODEX_HOME`, validates the exact regular bundle layout and both
 OpenAI code identities, then applies the same schema and live-readiness gates.
 
-Windows bridge inventory advertises a backend set. Satelle requires `chrome`
+Native bridge inventory advertises a backend set. Satelle requires `chrome`
 and `iab`, admits the official `mcpapps` capability, and rejects duplicate or
 unknown backend names. The isolated native Sky runtime receives only
 `chrome,iab`; inventory discovery does not grant another backend access.
+The macOS browser cache version is validated independently of the desktop
+version. Its browser service must remain under the current Codex home's official
+browser cache path, and is discarded from the isolated Sky binding.
 The Windows MCP transport must inherit exactly `CODEX_WINDOWS_REGISTERED_CORE`
 through `env_vars`, and the native execution environment must declare the same
 name in `NODE_REPL_UNTRUSTED_ENV_ALLOWLIST`. Satelle preserves these declarations
