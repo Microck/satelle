@@ -1820,14 +1820,18 @@ impl ExecuteResult {
 /// The only external Computer Use seam. SQLite remains concrete and internal;
 /// production and deterministic adapters vary only at this true I/O seam.
 pub trait ComputerUseAdapter: Send + Sync + 'static {
-    fn app_approval_requests(&self) -> Result<Vec<crate::host::AppApprovalRequest>, SatelleError> {
+    fn native_approval_requests(
+        &self,
+        _authority: crate::host::NativeApprovalAuthority<'_>,
+    ) -> Result<Vec<crate::host::NativeApprovalRequest>, SatelleError> {
         Ok(Vec::new())
     }
 
-    fn respond_to_app_approval(
+    fn respond_to_native_approval(
         &self,
         _id: &crate::core::ActionRequestId,
-        _decision: crate::host::AppApprovalDecision,
+        _decision: crate::host::NativeApprovalDecision,
+        _authority: crate::host::NativeApprovalAuthority<'_>,
     ) -> Result<(), SatelleError> {
         Err(SatelleError::invalid_usage(
             "the app approval request is no longer pending",

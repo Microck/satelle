@@ -1945,53 +1945,53 @@ mod tests {
     }
 }
 
-define_schema_token!(AppApprovalsSchema, "satelle.app-approvals.v1");
+define_schema_token!(NativeApprovalsSchema, "satelle.native-approvals.v1");
 define_schema_token!(
-    AppApprovalResponseSchema,
-    "satelle.app-approval-response.v1"
+    NativeApprovalResponseSchema,
+    "satelle.native-approval-response.v1"
 );
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct AppApprovalResponseRequest {
-    schema_version: AppApprovalResponseSchema,
-    pub decision: crate::host::AppApprovalDecision,
+pub struct NativeApprovalResponseRequest {
+    schema_version: NativeApprovalResponseSchema,
+    pub decision: crate::host::NativeApprovalDecision,
 }
-impl AppApprovalResponseRequest {
-    pub fn new(decision: crate::host::AppApprovalDecision) -> Self {
+impl NativeApprovalResponseRequest {
+    pub fn new(decision: crate::host::NativeApprovalDecision) -> Self {
         Self {
-            schema_version: AppApprovalResponseSchema,
+            schema_version: NativeApprovalResponseSchema,
             decision,
         }
     }
 }
-impl ApiRequestContract for AppApprovalResponseRequest {
-    const SCHEMA_VERSION: &'static str = "satelle.app-approval-response.v1";
+impl ApiRequestContract for NativeApprovalResponseRequest {
+    const SCHEMA_VERSION: &'static str = "satelle.native-approval-response.v1";
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct AppApprovalsResponse {
-    schema_version: AppApprovalsSchema,
+pub struct NativeApprovalsResponse {
+    schema_version: NativeApprovalsSchema,
     request_id: RequestId,
     host_identity: String,
-    pub requests: Vec<crate::host::AppApprovalRequest>,
+    pub requests: Vec<crate::host::NativeApprovalRequest>,
 }
-impl AppApprovalsResponse {
+impl NativeApprovalsResponse {
     pub(crate) fn new(
         request_id: RequestId,
         host_identity: String,
-        requests: Vec<crate::host::AppApprovalRequest>,
+        requests: Vec<crate::host::NativeApprovalRequest>,
     ) -> Self {
         Self {
-            schema_version: AppApprovalsSchema,
+            schema_version: NativeApprovalsSchema,
             request_id,
             host_identity,
             requests,
         }
     }
 }
-impl AuthenticatedResponseContract for AppApprovalsResponse {
+impl AuthenticatedResponseContract for NativeApprovalsResponse {
     fn request_id(&self) -> &RequestId {
         &self.request_id
     }
@@ -2002,22 +2002,22 @@ impl AuthenticatedResponseContract for AppApprovalsResponse {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct AppApprovalResponse {
-    schema_version: AppApprovalResponseSchema,
+pub struct NativeApprovalResponse {
+    schema_version: NativeApprovalResponseSchema,
     request_id: RequestId,
     host_identity: String,
     pub action_request_id: crate::core::ActionRequestId,
-    pub decision: crate::host::AppApprovalDecision,
+    pub decision: crate::host::NativeApprovalDecision,
 }
-impl AppApprovalResponse {
+impl NativeApprovalResponse {
     pub(crate) fn new(
         request_id: RequestId,
         host_identity: String,
         action_request_id: crate::core::ActionRequestId,
-        decision: crate::host::AppApprovalDecision,
+        decision: crate::host::NativeApprovalDecision,
     ) -> Self {
         Self {
-            schema_version: AppApprovalResponseSchema,
+            schema_version: NativeApprovalResponseSchema,
             request_id,
             host_identity,
             action_request_id,
@@ -2025,7 +2025,7 @@ impl AppApprovalResponse {
         }
     }
 }
-impl AuthenticatedResponseContract for AppApprovalResponse {
+impl AuthenticatedResponseContract for NativeApprovalResponse {
     fn request_id(&self) -> &RequestId {
         &self.request_id
     }

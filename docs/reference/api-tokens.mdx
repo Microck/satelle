@@ -22,7 +22,7 @@ Send these headers with each mutation:
 | --- | --- |
 | `Authorization` | `Bearer <admin-token>` |
 | `Satelle-Expected-Host-Identity` | The pinned Host identity |
-| `Satelle-Protocol-Version` | `22` |
+| `Satelle-Protocol-Version` | `23` |
 | `Idempotency-Key` | One unique key for the intended operation |
 | `Content-Type` | `application/json` |
 
@@ -46,6 +46,12 @@ Send `POST /v1/api-tokens`:
 `diagnostics_sensitive`. Control includes read, and admin includes control.
 Sensitive diagnostics require their separate scope. Duplicate scopes and their
 order do not change the request's meaning.
+
+Inspecting native app-access and exact tool-code requests through `GET /v1/actions`
+requires control scope. The list contains only requests for the token's granted
+desktop bindings. Responses cannot approve or deny a request on another binding,
+even when the caller knows its request ID. Ordinary read scope never exposes
+pending tool code.
 
 `desktop_bindings` grants the token access to exact configured Desktop Binding
 aliases. A token with `control` or `admin` scope needs at least one grant. An

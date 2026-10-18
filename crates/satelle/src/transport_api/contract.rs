@@ -32,11 +32,11 @@ pub use read::{
 pub(crate) use session::ApiRequestContract;
 pub(crate) use session::TurnRequestParts;
 pub use session::{
-    AdmissionCancellationOutcome, AdmissionCancellationResponse, AppApprovalResponse,
-    AppApprovalResponseRequest, AppApprovalsResponse, DesktopSnapshotAcknowledgeRequest,
+    AdmissionCancellationOutcome, AdmissionCancellationResponse, DesktopSnapshotAcknowledgeRequest,
     DesktopSnapshotAcknowledgeResponse, DesktopSnapshotCaptureRequest,
     DesktopSnapshotCaptureResponse, DesktopSnapshotContractError, ImageAttachment,
     MAX_IMAGE_ATTACHMENT_BYTES, MAX_IMAGE_ATTACHMENT_BYTES_TOTAL, MAX_IMAGE_ATTACHMENT_COUNT,
+    NativeApprovalResponse, NativeApprovalResponseRequest, NativeApprovalsResponse,
     QueueCancelResponse, QueueStatusResponse, RawProtocolAcknowledgeRequest,
     RawProtocolAcknowledgeResponse, RawProtocolCaptureRequest, RawProtocolDownloadResponse,
     RawSubprocessBeginRequest, RawSubprocessBeginResponse, RawSubprocessPrepareRequest,
@@ -565,8 +565,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_the_v20_hard_cut() {
-        assert_eq!(PROTOCOL_VERSION, "22");
+    fn protocol_version_is_the_native_approval_subject_hard_cut() {
+        assert_eq!(PROTOCOL_VERSION, "23");
     }
 
     #[test]

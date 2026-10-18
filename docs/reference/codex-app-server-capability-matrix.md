@@ -93,6 +93,21 @@ rejects a bridge parented by a separate standalone Codex release. Satelle keeps
 its managed `CODEX_HOME`, validates the exact regular bundle layout and both
 OpenAI code identities, then applies the same schema and live-readiness gates.
 
+Native tool-code approval and app-access approval are separate subjects in the
+same authenticated `action list` / `action respond` channel. A generated script
+correlated to its exact thread and turn requires an explicit one-request
+operator decision, even when an app already has a saved grant. Tool-code
+requests expose the exact JavaScript through the ephemeral authenticated
+request; persisted action events contain its request identifier, not the code.
+Tool-code decisions cannot use Always allow. Host-owned readiness still
+requires its exact script and app authority. Native turns require successful
+correlated tool completion even when the saved app grant set is empty.
+
+Protocol 23 uses `satelle.native-approvals.v1` with a tagged `subject`:
+`app` contains `app_id` and `allow_always`; `tool_code` contains the exact
+`code`. Approval responses use `satelle.native-approval-response.v1`.
+Clients and Hosts must use the same protocol; the old app-only shape is rejected.
+
 Native bridge inventory advertises a backend set. Satelle requires `chrome`
 and `iab`, admits the official `mcpapps` capability, and rejects duplicate or
 unknown backend names. The isolated native Sky runtime receives only

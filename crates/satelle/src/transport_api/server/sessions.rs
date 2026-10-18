@@ -1035,14 +1035,21 @@ mod admission_action_tests {
     }
 }
 
-pub(super) async fn app_approval_requests(
+pub(super) async fn native_approval_requests(
     State(state): State<Arc<DaemonState>>,
     Extension(authorized): Extension<AuthorizedRequest>,
 ) -> Response {
-    match state.service.app_approval_requests() {
+    if !authorized.principal().scopes().allows(ApiScopes::CONTROL) {
+        return super::auth::insufficient_scope(&state, &authorized, "control");
+    }
+    match state.service.native_approval_requests(
+        crate::host::NativeApprovalAuthority::DesktopBindings(
+            authorized.principal().desktop_bindings(),
+        ),
+    ) {
         Ok(requests) => authenticated_json_response(
             StatusCode::OK,
-            &crate::transport::AppApprovalsResponse::new(
+            &crate::transport::NativeApprovalsResponse::new(
                 authorized.request_id().clone(),
                 state.host_identity.clone(),
                 requests,
@@ -1054,20 +1061,26 @@ pub(super) async fn app_approval_requests(
     }
 }
 
-pub(super) async fn respond_to_app_approval(
+pub(super) async fn respond_to_native_approval(
     State(state): State<Arc<DaemonState>>,
     Extension(authorized): Extension<AuthorizedRequest>,
     Path(id): Path<String>,
-    ApiJson(request): ApiJson<crate::transport::AppApprovalResponseRequest>,
+    ApiJson(request): ApiJson<crate::transport::NativeApprovalResponseRequest>,
 ) -> Response {
     let id = match crate::core::ActionRequestId::parse(&id) {
         Ok(id) => id,
         Err(_) => return request_error(&state, &authorized, "invalid app approval request id"),
     };
-    match state.service.respond_to_app_approval(&id, request.decision) {
+    match state.service.respond_to_native_approval(
+        &id,
+        request.decision,
+        crate::host::NativeApprovalAuthority::DesktopBindings(
+            authorized.principal().desktop_bindings(),
+        ),
+    ) {
         Ok(()) => authenticated_json_response(
             StatusCode::OK,
-            &crate::transport::AppApprovalResponse::new(
+            &crate::transport::NativeApprovalResponse::new(
                 authorized.request_id().clone(),
                 state.host_identity.clone(),
                 id,

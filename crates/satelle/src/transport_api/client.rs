@@ -942,22 +942,24 @@ impl DaemonClient {
         self.send_authenticated(request, request_id, StatusCode::ACCEPTED)
     }
 
-    pub fn app_approval_requests(
+    pub fn native_approval_requests(
         &self,
-    ) -> Result<crate::transport::AppApprovalsResponse, DaemonClientError> {
+    ) -> Result<crate::transport::NativeApprovalsResponse, DaemonClientError> {
         let (request, request_id) = self.protected_request(Method::GET, "/v1/actions")?;
         self.send_authenticated(request, request_id, StatusCode::OK)
     }
 
-    pub fn respond_to_app_approval(
+    pub fn respond_to_native_approval(
         &self,
         id: &crate::core::ActionRequestId,
-        decision: crate::host::AppApprovalDecision,
-    ) -> Result<crate::transport::AppApprovalResponse, DaemonClientError> {
+        decision: crate::host::NativeApprovalDecision,
+    ) -> Result<crate::transport::NativeApprovalResponse, DaemonClientError> {
         let path = format!("/v1/actions/{id}/respond");
         let (request, request_id) = self.mutation_request(&path, id.as_str())?;
-        let response: crate::transport::AppApprovalResponse = self.send_authenticated(
-            request.json(&crate::transport::AppApprovalResponseRequest::new(decision)),
+        let response: crate::transport::NativeApprovalResponse = self.send_authenticated(
+            request.json(&crate::transport::NativeApprovalResponseRequest::new(
+                decision,
+            )),
             request_id,
             StatusCode::OK,
         )?;

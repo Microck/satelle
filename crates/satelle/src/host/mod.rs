@@ -3,7 +3,9 @@ mod api_auth;
 #[path = "app-approval.rs"]
 mod app_approval;
 mod attachment;
-pub use app_approval::{AppApprovalDecision, AppApprovalRequest};
+pub use app_approval::{
+    NativeApprovalAuthority, NativeApprovalDecision, NativeApprovalRequest, NativeApprovalSubject,
+};
 mod codex_capabilities;
 #[path = "codex-install.rs"]
 mod codex_install;
@@ -2192,15 +2194,20 @@ impl HostService {
         )
         .map_err(runtime::storage_failure)
     }
-    pub fn app_approval_requests(&self) -> Result<Vec<AppApprovalRequest>, SatelleError> {
-        self.runtime.app_approval_requests()
+    pub fn native_approval_requests(
+        &self,
+        authority: NativeApprovalAuthority<'_>,
+    ) -> Result<Vec<NativeApprovalRequest>, SatelleError> {
+        self.runtime.native_approval_requests(authority)
     }
-    pub fn respond_to_app_approval(
+    pub fn respond_to_native_approval(
         &self,
         id: &crate::core::ActionRequestId,
-        decision: AppApprovalDecision,
+        decision: NativeApprovalDecision,
+        authority: NativeApprovalAuthority<'_>,
     ) -> Result<(), SatelleError> {
-        self.runtime.respond_to_app_approval(id, decision)
+        self.runtime
+            .respond_to_native_approval(id, decision, authority)
     }
 
     pub fn begin_storage_migration_idempotent(

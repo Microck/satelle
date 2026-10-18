@@ -413,15 +413,15 @@ fn setup_provider_intent(
 /// The command surface is intentionally exhaustive. A new transport operation
 /// must be implemented or explicitly rejected by every backend.
 pub(crate) trait TransportClient: Send {
-    fn app_approval_requests(
+    fn native_approval_requests(
         &self,
-    ) -> Result<Vec<satelle::host::AppApprovalRequest>, SatelleError> {
+    ) -> Result<Vec<satelle::host::NativeApprovalRequest>, SatelleError> {
         Err(SatelleError::native_action_relay_not_supported())
     }
-    fn respond_to_app_approval(
+    fn respond_to_native_approval(
         &self,
         _id: &satelle::core::ActionRequestId,
-        _decision: satelle::host::AppApprovalDecision,
+        _decision: satelle::host::NativeApprovalDecision,
     ) -> Result<(), SatelleError> {
         Err(SatelleError::native_action_relay_not_supported())
     }
@@ -941,17 +941,22 @@ fn interrupted_admission_race_error(alias: &str) -> SatelleError {
 }
 
 impl TransportClient for LocalTransport {
-    fn app_approval_requests(
+    fn native_approval_requests(
         &self,
-    ) -> Result<Vec<satelle::host::AppApprovalRequest>, SatelleError> {
-        self.service.app_approval_requests()
+    ) -> Result<Vec<satelle::host::NativeApprovalRequest>, SatelleError> {
+        self.service
+            .native_approval_requests(satelle::host::NativeApprovalAuthority::Owner)
     }
-    fn respond_to_app_approval(
+    fn respond_to_native_approval(
         &self,
         id: &satelle::core::ActionRequestId,
-        decision: satelle::host::AppApprovalDecision,
+        decision: satelle::host::NativeApprovalDecision,
     ) -> Result<(), SatelleError> {
-        self.service.respond_to_app_approval(id, decision)
+        self.service.respond_to_native_approval(
+            id,
+            decision,
+            satelle::host::NativeApprovalAuthority::Owner,
+        )
     }
 
     fn log_target_identity(&self) -> Result<String, SatelleError> {
@@ -7945,24 +7950,24 @@ impl TransportClient for SshSetupTransport {
 }
 
 impl TransportClient for DirectTransport {
-    fn app_approval_requests(
+    fn native_approval_requests(
         &self,
-    ) -> Result<Vec<satelle::host::AppApprovalRequest>, SatelleError> {
+    ) -> Result<Vec<satelle::host::NativeApprovalRequest>, SatelleError> {
         self.client
-            .app_approval_requests()
+            .native_approval_requests()
             .map(|response| response.requests)
             .map_err(|error| direct_transport_error(&self.alias, error))
     }
-    fn respond_to_app_approval(
+    fn respond_to_native_approval(
         &self,
         id: &satelle::core::ActionRequestId,
-        decision: satelle::host::AppApprovalDecision,
+        decision: satelle::host::NativeApprovalDecision,
     ) -> Result<(), SatelleError> {
         self.client
-            .respond_to_app_approval(id, decision)
+            .respond_to_native_approval(id, decision)
             .map(|_| ())
             .map_err(|error| match error {
-                DaemonClientError::Api { error, .. } if error.code() == ApiErrorCode::InvalidRequest => SatelleError::invalid_usage("the app approval request is no longer pending or does not support this decision"),
+                DaemonClientError::Api { error, .. } if error.code() == ApiErrorCode::InvalidRequest => SatelleError::invalid_usage("the native approval request is no longer pending or does not support this decision"),
                 error => direct_transport_error(&self.alias, error),
             })
     }

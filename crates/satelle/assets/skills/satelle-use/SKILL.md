@@ -45,17 +45,33 @@ Use `satelle stop <session_id>` when the active turn should stop. Do not treat s
 
 Completion criterion: the session remains inspectable and later steering is possible when the stored thread is available.
 
-## App access decisions
+## Native approval decisions
 
-When an `action_required` event has `kind: native_app_approval`, show the requested app and host to the human in the initiating chat or terminal. `satelle action list --host <alias> --json` also lists live requests, including those from readiness checks.
+When an `action_required` event has `kind: native_approval`, fetch the exact
+pending request with `satelle action list --host <alias> --json`. The event
+contains its request ID, not the code. The list also includes readiness requests.
 
-Ask the human to choose allow once, Always allow when `allow_always` is true, or deny. Send only their explicit decision:
+Inspect `subject.kind` before presenting or answering it:
+
+- `app`: show the Host, `desktop_binding`, and `subject.app_id`. Ask for allow once, Always allow
+  only when `subject.allow_always` is true, or deny.
+- `tool_code`: show the Host, `desktop_binding`, and exact `subject.code` for the `node_repl` js
+  call. Explain that code can access files independently of app access. Ask
+  for allow once or deny. Never use Always allow for code.
+
+Send only the operator's explicit decision for that exact request:
 
 - `satelle action respond <action_request_id> --host <alias> --allow`
 - `satelle action respond <action_request_id> --host <alias> --allow --always`
 - `satelle action respond <action_request_id> --host <alias> --deny`
 
-The same operation resumes after the response. Do not start a competing turn. Requests expire when the operation ends or after five minutes at most. Re-read pending requests before answering a stale ID. Do not infer app consent from task authorization, YOLO, or `--yes`, and never edit native app policy files. OS privacy and administrator prompts still require the human on the device.
+The same operation resumes after the response. Do not start a competing turn.
+Requests expire when the operation ends or after five minutes at most. Re-read
+pending requests before answering a stale ID. A saved app grant is never code
+consent. Do not infer either consent from task authorization, YOLO, or `--yes`.
+Never edit native app policy files. OS privacy and administrator prompts still
+require the human on the device. Clients and Hosts must share protocol 23;
+old app-only payloads are not accepted.
 
 ## Output Formats
 
