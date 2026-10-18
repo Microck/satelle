@@ -910,6 +910,11 @@ fn run_scenario_with_options(
         .lines()
         .map(|line| serde_json::from_str(line).expect("request JSON"))
         .collect();
+    let child_working_directory = PathBuf::from(
+        std::fs::read_to_string(cwd_log_path).unwrap_or_else(|error| {
+            panic!("scenario {scenario}: child working-directory record missing: {error}; outcome {result:?}, elapsed {session_elapsed:?}, turn dispatched {turn_dispatch_attempted}")
+        }),
+    );
     ScenarioResult {
         result,
         session_elapsed,
@@ -918,9 +923,7 @@ fn run_scenario_with_options(
         persisted_threads,
         persisted_turns,
         native_approval_requests,
-        child_working_directory: PathBuf::from(
-            std::fs::read_to_string(cwd_log_path).expect("child working-directory record"),
-        ),
+        child_working_directory,
         staged_image_path,
         _fixture: fixture,
         directory,
@@ -1858,12 +1861,11 @@ fn malformed_and_adversarial_messages_fail_closed() {
         ("thread-response-error", CodexSessionError::ResponseError),
         ("timeout", CodexSessionError::Timeout),
     ] {
-        // This table checks protocol classification, not process-start or pipe
-        // throughput. Keep short deadlines only for scenarios that must prove
-        // timeout behavior; loaded Windows and macOS runners need more time to
-        // reach the later protocol states and transfer the oversized fixture.
+        // Classification needs a started fixture, just like the dedicated
+        // cleanup tests. Reuse their native startup budget without changing
+        // the short Linux timeout or any classification/redaction assertion.
         let timeout = if matches!(scenario, "timeout" | "unterminated") {
-            Duration::from_millis(500)
+            process_startup_timeout(Duration::from_millis(500))
         } else {
             Duration::from_secs(3)
         };
