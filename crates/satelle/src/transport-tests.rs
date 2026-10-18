@@ -7272,6 +7272,40 @@ fn manual_macos_setup_details_round_trip_only_in_the_closed_shape() {
 }
 
 #[test]
+fn macos_approval_read_api_errors_preserve_trusted_recovery_guidance() {
+    for reason in [
+        "macos_app_policy_read_timed_out",
+        "macos_app_policy_read_unavailable",
+    ] {
+        let api_error = serde_json::from_value::<ApiError>(serde_json::json!({
+            "schema_version": "satelle.error.v1",
+            "request_id": satelle::transport::RequestId::new().to_string(),
+            "host_identity": "host-direct-test",
+            "code": "computer-use-not-ready",
+            "category": "readiness",
+            "retryable": false,
+            "message": "PRIVATE_REMOTE_MESSAGE_CANARY",
+            "details": {"reason": reason},
+            "docs_url": null,
+            "suggested_commands": []
+        }))
+        .expect("deserialize actual API error contract");
+        let mapped = map_api_error("clean-mac", &api_error);
+        assert_eq!(mapped.code, ErrorCode::ComputerUseNotReady);
+        assert_eq!(mapped.details["reason"], reason);
+        assert_eq!(
+            mapped.message,
+            "Satelle could not read saved macOS app approvals; check for a Satelle app-data privacy prompt on the Mac and retry"
+        );
+        assert_eq!(
+            mapped.recovery_command.as_deref(),
+            Some("satelle doctor --scope computer-use --refresh --json")
+        );
+        assert!(!mapped.message.contains("PRIVATE_REMOTE_MESSAGE_CANARY"));
+    }
+}
+
+#[test]
 fn managed_setup_failure_reconciles_only_a_validated_no_change_result() {
     let api_error = |details: serde_json::Value| {
         serde_json::from_value::<ApiError>(serde_json::json!({
