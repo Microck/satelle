@@ -3037,17 +3037,20 @@ impl std::fmt::Debug for RuntimeHandle {
 }
 
 impl RuntimeHandle {
-    pub(crate) fn app_approval_requests(
+    pub(crate) fn native_approval_requests(
         &self,
-    ) -> Result<Vec<crate::host::AppApprovalRequest>, SatelleError> {
-        self.adapter.app_approval_requests()
+        authority: crate::host::NativeApprovalAuthority<'_>,
+    ) -> Result<Vec<crate::host::NativeApprovalRequest>, SatelleError> {
+        self.adapter.native_approval_requests(authority)
     }
-    pub(crate) fn respond_to_app_approval(
+    pub(crate) fn respond_to_native_approval(
         &self,
         id: &crate::core::ActionRequestId,
-        decision: crate::host::AppApprovalDecision,
+        decision: crate::host::NativeApprovalDecision,
+        authority: crate::host::NativeApprovalAuthority<'_>,
     ) -> Result<(), SatelleError> {
-        self.adapter.respond_to_app_approval(id, decision)
+        self.adapter
+            .respond_to_native_approval(id, decision, authority)
     }
 
     pub(crate) fn queue_config(&self) -> Result<crate::core::queue::QueueConfig, SatelleError> {

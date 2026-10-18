@@ -93,7 +93,7 @@ async fn queued_turns_preserve_fifo_through_cancellation_and_maintenance_release
     let first_path = format!("/v1/queue/{}", first.queue_request_id);
     let cancelled = running
         .protected_request(Method::DELETE, &first_path)
-        .header("Satelle-Protocol-Version", "22")
+        .header("Satelle-Protocol-Version", CURRENT_PROTOCOL_VERSION)
         .header("Idempotency-Key", "queue-http-cancel-first")
         .send()
         .await
@@ -1717,7 +1717,7 @@ async fn mutation_validation_fails_before_execution_with_typed_errors() {
 
     let missing_key = running
         .protected_request(Method::POST, "/v1/sessions")
-        .header("Satelle-Protocol-Version", "22")
+        .header("Satelle-Protocol-Version", CURRENT_PROTOCOL_VERSION)
         .json(&TurnRequest::new("PRIVATE_MISSING_KEY_CANARY"))
         .send()
         .await
@@ -2381,7 +2381,7 @@ fn protected_at(
         .header("Satelle-Expected-Host-Identity", host_identity)
         .header("Satelle-Request-Id", RequestId::new().to_string());
     if is_mutation {
-        request.header("Satelle-Protocol-Version", "22")
+        request.header("Satelle-Protocol-Version", CURRENT_PROTOCOL_VERSION)
     } else {
         request
     }
@@ -2527,8 +2527,8 @@ async fn assert_exact_api_error(
 
 #[tokio::test]
 async fn app_approval_responses_require_control_and_validate_the_exact_request() {
-    let request = satelle::transport::AppApprovalResponseRequest::new(
-        satelle::host::AppApprovalDecision::Always,
+    let request = satelle::transport::NativeApprovalResponseRequest::new(
+        satelle::host::NativeApprovalDecision::Always,
     );
     let id = satelle::core::ActionRequestId::new();
     let path = format!("/v1/actions/{id}/respond");

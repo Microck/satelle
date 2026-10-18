@@ -251,3 +251,52 @@ fn native_turn_accepts_the_official_result_shape_without_duplicate_elicitation()
     let run = run_native_scenario("native-task-no-approval", Duration::from_secs(3));
     assert_eq!(run.result, Ok(CodexSessionTerminal::Completed));
 }
+
+#[test]
+fn native_turn_without_imported_grants_still_requires_successful_tool_evidence() {
+    for (scenario, expected) in [
+        ("native-task-success", Ok(CodexSessionTerminal::Completed)),
+        (
+            "native-task-missing",
+            Err(CodexSessionError::NativeActionUnavailable),
+        ),
+        (
+            "native-task-failed",
+            Err(CodexSessionError::NativeActionUnavailable),
+        ),
+    ] {
+        let run = run_scenario_with_options(
+            scenario,
+            None,
+            Duration::from_secs(3),
+            "use the native SDK",
+            PersistFailure::None,
+            ScenarioExecution {
+                native_code_decision: Some(crate::host::NativeApprovalDecision::Allow),
+                ..ScenarioExecution::STANDARD
+            },
+        );
+        assert_eq!(run.result, expected, "scenario {scenario}");
+    }
+}
+
+#[test]
+fn native_code_without_saved_grants_declines_without_an_explicit_allow() {
+    for decision in [None, Some(crate::host::NativeApprovalDecision::Deny)] {
+        let run = run_scenario_with_options(
+            "native-task-code-denied",
+            None,
+            Duration::from_secs(3),
+            "use the native SDK",
+            PersistFailure::None,
+            ScenarioExecution {
+                native_code_decision: decision,
+                native_app_decision: Some(crate::host::NativeApprovalDecision::Allow),
+                ..ScenarioExecution::STANDARD
+            },
+        );
+        assert_eq!(run.result, Err(CodexSessionError::NativeActionUnavailable));
+        assert_eq!(run.requests[5]["result"]["action"], "decline");
+        assert_eq!(run.requests[5]["result"]["_meta"], Value::Null);
+    }
+}

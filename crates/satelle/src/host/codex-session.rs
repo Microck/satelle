@@ -96,8 +96,11 @@ pub(crate) struct CodexSessionRequest<'a> {
     pub(crate) persist_thread_ref: &'a mut dyn FnMut(&str) -> Result<(), ()>,
     pub(crate) persist_turn_ref: &'a mut dyn FnMut(&str) -> Result<(), ()>,
     pub(crate) observe_native_approval: Option<&'a mut dyn FnMut()>,
-    pub(crate) request_app_approval:
-        Option<&'a mut dyn FnMut(String, bool) -> Option<super::app_approval::PendingAppApproval>>,
+    pub(crate) request_native_approval: Option<
+        &'a mut dyn FnMut(
+            super::NativeApprovalSubject,
+        ) -> Option<super::app_approval::PendingNativeApproval>,
+    >,
     pub(crate) native_action_evidence: Option<crate::host::provider_probe::NativeActionEvidence>,
     pub(crate) expected_mcp_server_name: &'a str,
     pub(crate) computer_use_allowed_app_ids: &'a BTreeSet<String>,
@@ -601,7 +604,7 @@ struct SessionExchange<'a> {
     stop_committed: bool,
     active_native_tools: BTreeMap<String, String>,
     native_tool_succeeded: bool,
-    pending_app_approvals: Vec<(Value, super::app_approval::PendingAppApproval)>,
+    pending_native_approvals: Vec<(Value, super::app_approval::PendingNativeApproval)>,
 }
 
 struct ServerResponse {
@@ -632,7 +635,7 @@ impl<'a> SessionExchange<'a> {
             stop_committed: false,
             active_native_tools: BTreeMap::new(),
             native_tool_succeeded: false,
-            pending_app_approvals: Vec::new(),
+            pending_native_approvals: Vec::new(),
         }
     }
 
@@ -693,23 +696,26 @@ impl<'a> SessionExchange<'a> {
         }
     }
 
-    fn resolve_app_approvals(&mut self, writer: &ProtocolWriter) -> Result<(), CodexSessionError> {
+    fn resolve_native_approvals(
+        &mut self,
+        writer: &ProtocolWriter,
+    ) -> Result<(), CodexSessionError> {
         let mut index = 0;
-        while index < self.pending_app_approvals.len() {
+        while index < self.pending_native_approvals.len() {
             let decision = if self.interrupt_sent {
-                Some(super::AppApprovalDecision::Deny)
+                Some(super::NativeApprovalDecision::Deny)
             } else {
-                self.pending_app_approvals[index].1.decision()
+                self.pending_native_approvals[index].1.decision()
             };
             let Some(decision) = decision else {
                 index += 1;
                 continue;
             };
-            let (id, _operation_guard) = self.pending_app_approvals.remove(index);
-            let accepted = decision != super::AppApprovalDecision::Deny;
+            let (id, _operation_guard) = self.pending_native_approvals.remove(index);
+            let accepted = decision != super::NativeApprovalDecision::Deny;
             writer.write(&json!({"id": id, "result": {
                 "action": if accepted { "accept" } else { "decline" }, "content": null,
-                "_meta": if decision == super::AppApprovalDecision::Always { json!({"persist":"always"}) } else { Value::Null },
+                "_meta": if decision == super::NativeApprovalDecision::Always { json!({"persist":"always"}) } else { Value::Null },
             }}))?;
             if !accepted && let Some(observer) = self.request.observe_native_approval.as_mut() {
                 observer();
@@ -724,7 +730,7 @@ impl<'a> SessionExchange<'a> {
         receiver: &mpsc::Receiver<ReadEvent>,
     ) -> Result<(), CodexSessionError> {
         self.poll_control(writer)?;
-        self.resolve_app_approvals(writer)?;
+        self.resolve_native_approvals(writer)?;
         if self.controlled_stop {
             return Ok(());
         }
@@ -733,7 +739,7 @@ impl<'a> SessionExchange<'a> {
             .deadline
             .checked_duration_since(Instant::now())
             .ok_or(CodexSessionError::Timeout)?;
-        let wait = if self.control.is_some() || !self.pending_app_approvals.is_empty() {
+        let wait = if self.control.is_some() || !self.pending_native_approvals.is_empty() {
             remaining.min(CONTROL_POLL_INTERVAL)
         } else {
             remaining
@@ -889,21 +895,33 @@ impl<'a> SessionExchange<'a> {
                     .map(|(script, app_id)| (script.as_str(), app_id.as_str())),
                 self.thread_ref.as_deref(),
                 self.turn_ref.as_deref(),
-                self.request.request_app_approval.is_some(),
+                self.request.request_native_approval.is_some(),
             )?;
-            if !authorization.accepted()
-                && let Some(params) = object.get("params").and_then(Value::as_object)
-                && let Some((app_id, allow_always)) =
-                    codex_approval::computer_use_app_request(params)
-                && let Some(callback) = self.request.request_app_approval.as_mut()
-                && let Some(pending) = callback(app_id, allow_always)
+            let accepted = authorization.accepted();
+            let approval_subject = match authorization {
+                codex_approval::ComputerUseAuthorization::CodeApprovalRequired(code) => {
+                    Some(super::NativeApprovalSubject::ToolCode { code })
+                }
+                _ if !accepted => object
+                    .get("params")
+                    .and_then(Value::as_object)
+                    .and_then(codex_approval::computer_use_app_request)
+                    .map(|(app_id, allow_always)| super::NativeApprovalSubject::App {
+                        app_id,
+                        allow_always,
+                    }),
+                _ => None,
+            };
+            if let Some(approval_subject) = approval_subject
+                && let Some(callback) = self.request.request_native_approval.as_mut()
+                && let Some(pending) = callback(approval_subject)
             {
-                self.pending_app_approvals.push((id.clone(), pending));
+                self.pending_native_approvals.push((id.clone(), pending));
                 return Ok(None);
             }
             return Ok(Some(ServerResponse {
                 body: json!({"id": id, "result": result}),
-                observe_native_approval: !authorization.accepted(),
+                observe_native_approval: !accepted,
             }));
         }
         if let Some(result) = codex_approval::approval_result(
@@ -1079,7 +1097,7 @@ impl<'a> SessionExchange<'a> {
                 let id = params
                     .get("requestId")
                     .ok_or(CodexSessionError::MalformedMessage)?;
-                self.pending_app_approvals
+                self.pending_native_approvals
                     .retain(|(pending_id, _)| pending_id != id);
                 Ok(())
             }
@@ -1250,7 +1268,10 @@ impl<'a> SessionExchange<'a> {
     }
 
     fn requires_native_action_evidence(&self) -> bool {
-        !self.request.computer_use_allowed_app_ids.is_empty()
+        // The verified Sky runtime is native even before its first app grant.
+        // An empty imported grant set must never disable completion evidence.
+        self.request.expected_mcp_server_name == "node_repl"
+            || !self.request.computer_use_allowed_app_ids.is_empty()
     }
 
     fn observe_native_tool_item(
@@ -1306,8 +1327,8 @@ impl<'a> SessionExchange<'a> {
                     // and emits `completed` only for a successful call. Its
                     // result metadata is intentionally opaque and currently
                     // contains timing data, not a stable per-app authority
-                    // field. Admission freezes app authority for this exact
-                    // Turn, while this correlated lifecycle proves that its
+                    // field. The SDK and correlated app-consent requests
+                    // enforce app access; this lifecycle proves only that the
                     // generated native script completed successfully.
                     self.native_tool_succeeded = true;
                 }

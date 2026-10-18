@@ -150,7 +150,7 @@ pub(crate) struct ProductionComputerUseAdapter {
     snapshot: Arc<RwLock<crate::host::ProductionCapabilitySnapshot>>,
     working_directory: Result<PathBuf, SatelleError>,
     active_executions: Arc<Mutex<BTreeMap<String, ActiveCodexExecution>>>,
-    app_approvals: crate::host::app_approval::AppApprovals,
+    native_approvals: crate::host::app_approval::NativeApprovals,
     native_readiness_timeout: Duration,
     native_readiness_ttl: time::Duration,
     provider_smoke_timeout: Duration,
@@ -206,7 +206,7 @@ impl ProductionComputerUseAdapter {
             snapshot,
             working_directory,
             active_executions: Arc::new(Mutex::new(BTreeMap::new())),
-            app_approvals: crate::host::app_approval::AppApprovals::default(),
+            native_approvals: crate::host::app_approval::NativeApprovals::default(),
             native_readiness_timeout: crate::host::DEFAULT_NATIVE_READINESS_TIMEOUT,
             native_readiness_ttl: crate::host::DEFAULT_NATIVE_READINESS_TTL,
             provider_smoke_timeout: Duration::from_secs(120),
@@ -235,7 +235,7 @@ impl ProductionComputerUseAdapter {
             snapshot,
             working_directory,
             active_executions: Arc::new(Mutex::new(BTreeMap::new())),
-            app_approvals: crate::host::app_approval::AppApprovals::default(),
+            native_approvals: crate::host::app_approval::NativeApprovals::default(),
             native_readiness_timeout: policy.native_readiness_timeout,
             native_readiness_ttl: policy.native_readiness_ttl,
             provider_smoke_timeout: policy.provider_smoke_timeout,
@@ -588,11 +588,10 @@ impl ProductionComputerUseAdapter {
             &native_action_evidence,
         )
         .map_err(native_smoke_failure)?;
-        let mut request_app_approval = |app_id: String, allow_always: bool| {
-            self.app_approvals
+        let mut request_native_approval = |approval_subject: crate::host::NativeApprovalSubject| {
+            self.native_approvals
                 .request(
-                    app_id,
-                    allow_always,
+                    approval_subject,
                     key.execution_policy().desktop_target().binding().as_str(),
                     None,
                     deadline,
@@ -621,7 +620,7 @@ impl ProductionComputerUseAdapter {
                 persist_thread_ref,
                 persist_turn_ref,
                 observe_native_approval: None,
-                request_app_approval: Some(&mut request_app_approval),
+                request_native_approval: Some(&mut request_native_approval),
                 native_action_evidence: None,
                 expected_mcp_server_name: &expected_mcp_server_name,
                 computer_use_allowed_app_ids: allowed_app_ids,
@@ -868,11 +867,10 @@ impl ProductionComputerUseAdapter {
             &native_action_evidence,
         )
         .map_err(|reason| mark_probe_dispatch_possible(adapter_failure(reason), false))?;
-        let mut request_app_approval = |app_id: String, allow_always: bool| {
-            self.app_approvals
+        let mut request_native_approval = |approval_subject: crate::host::NativeApprovalSubject| {
+            self.native_approvals
                 .request(
-                    app_id,
-                    allow_always,
+                    approval_subject,
                     key.execution_policy().desktop_target().binding().as_str(),
                     None,
                     deadline,
@@ -901,7 +899,7 @@ impl ProductionComputerUseAdapter {
                         persist_turn_ref: persistence.persist_turn_ref,
                     },
                 );
-                request.request_app_approval = Some(&mut request_app_approval);
+                request.request_native_approval = Some(&mut request_native_approval);
                 request
             },
             READINESS_CANCELLATION_GRACE,
@@ -1196,7 +1194,7 @@ fn provider_smoke_session_request<'a>(
         persist_thread_ref,
         persist_turn_ref,
         observe_native_approval: None,
-        request_app_approval: None,
+        request_native_approval: None,
         native_action_evidence: Some(native_action_evidence),
         expected_mcp_server_name,
         computer_use_allowed_app_ids,
@@ -2334,15 +2332,19 @@ fn annotate_provider_smoke_error(
 }
 
 impl ComputerUseAdapter for ProductionComputerUseAdapter {
-    fn app_approval_requests(&self) -> Result<Vec<crate::host::AppApprovalRequest>, SatelleError> {
-        self.app_approvals.list()
+    fn native_approval_requests(
+        &self,
+        authority: crate::host::NativeApprovalAuthority<'_>,
+    ) -> Result<Vec<crate::host::NativeApprovalRequest>, SatelleError> {
+        self.native_approvals.list(authority)
     }
-    fn respond_to_app_approval(
+    fn respond_to_native_approval(
         &self,
         id: &crate::core::ActionRequestId,
-        decision: crate::host::AppApprovalDecision,
+        decision: crate::host::NativeApprovalDecision,
+        authority: crate::host::NativeApprovalAuthority<'_>,
     ) -> Result<(), SatelleError> {
-        self.app_approvals.respond(id, decision)
+        self.native_approvals.respond(id, decision, authority)
     }
 
     fn admit_operation(&self, operation: ControlPlaneOperation) -> Result<(), SatelleError> {
@@ -2467,37 +2469,37 @@ impl ComputerUseAdapter for ProductionComputerUseAdapter {
                         *persistence_error.borrow_mut() = Some(error);
                     })
                 };
-                let mut request_app_approval = |app_id: String, allow_always: bool| {
-                    let subject = request.subject();
-                    let (approval, pending) = self
-                        .app_approvals
-                        .request(
-                            app_id,
-                            allow_always,
-                            policy.desktop_target().binding().as_str(),
-                            Some((subject.session_id(), subject.turn_id())),
-                            deadline,
-                        )
-                        .ok()?;
-                    request.publish_live_event(
-                        SatelleEventBody::new(
-                            EventType::ActionRequired,
-                            EventSource::CodexAdapter,
-                            time::OffsetDateTime::now_utc(),
-                            subject.host_identity().as_str(),
-                            Some(EventSubject::Turn {
-                                session_id: subject.session_id().clone(),
-                                turn_id: subject.turn_id().clone(),
-                                session_state_revision: request.committed_session_revision(),
-                                turn_state_revision: request.committed_turn_revision(),
-                            }),
-                            "app access needs your decision",
-                            json!({"kind":"native_app_approval", "request":approval}),
-                        )
-                        .expect("bounded app approval produces a safe event"),
-                    );
-                    Some(pending)
-                };
+                let mut request_native_approval =
+                    |approval_subject: crate::host::NativeApprovalSubject| {
+                        let subject = request.subject();
+                        let (approval, pending) = self
+                            .native_approvals
+                            .request(
+                                approval_subject,
+                                policy.desktop_target().binding().as_str(),
+                                Some((subject.session_id(), subject.turn_id())),
+                                deadline,
+                            )
+                            .ok()?;
+                        request.publish_live_event(
+                            SatelleEventBody::new(
+                                EventType::ActionRequired,
+                                EventSource::CodexAdapter,
+                                time::OffsetDateTime::now_utc(),
+                                subject.host_identity().as_str(),
+                                Some(EventSubject::Turn {
+                                    session_id: subject.session_id().clone(),
+                                    turn_id: subject.turn_id().clone(),
+                                    session_state_revision: request.committed_session_revision(),
+                                    turn_state_revision: request.committed_turn_revision(),
+                                }),
+                                "native access needs your decision; inspect it with action list",
+                                json!({"kind":"native_approval", "action_request_id":approval}),
+                            )
+                            .expect("native approval identifier produces a safe event"),
+                        );
+                        Some(pending)
+                    };
                 let mut native_approval_published = false;
                 let mut observe_native_approval = || {
                     if native_approval_published {
@@ -2569,7 +2571,7 @@ impl ComputerUseAdapter for ProductionComputerUseAdapter {
                         persist_thread_ref: &mut persist_thread_ref,
                         persist_turn_ref: &mut persist_turn_ref,
                         observe_native_approval: Some(&mut observe_native_approval),
-                        request_app_approval: Some(&mut request_app_approval),
+                        request_native_approval: Some(&mut request_native_approval),
                         native_action_evidence: None,
                         expected_mcp_server_name: &expected_mcp_server_name,
                         computer_use_allowed_app_ids: admitted_app_approval.allowed_app_ids(),

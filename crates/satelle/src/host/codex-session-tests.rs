@@ -73,6 +73,7 @@ fn main() {
         std::fs::write(path, value).unwrap();
     }
     let scenario = std::env::var("SATELLE_FIXTURE_SCENARIO").unwrap();
+    let native_server = if scenario.starts_with("native-task-") { "node_repl" } else { "computer-use" };
     let log = PathBuf::from(std::env::var_os("SATELLE_FIXTURE_LOG").unwrap());
     std::fs::write(
         std::env::var_os("SATELLE_FIXTURE_CWD_LOG").unwrap(),
@@ -159,7 +160,7 @@ fn main() {
         if scenario == "notification-first" {
             send(&mut output, &format!(r#"{{"method":"thread/started","params":{{"thread":{{"id":"{thread_id}"}}}}}}"#));
         }
-        send_mcp_ready(&mut output, thread_id);
+        send_mcp_ready(&mut output, thread_id, native_server);
         wait_for(&thread_marker);
         let plugin_request = receive(&mut input, &log);
         assert_plugin_inventory_request(&plugin_request);
@@ -179,7 +180,7 @@ fn main() {
             send(&mut output, &format!(r#"{{"method":"mcpServer/startupStatus/updated","params":{{"threadId":"{thread_id}","name":"unexpected","status":"starting","error":null,"failureReason":null}}}}"#));
             hang();
         }
-        send_mcp_ready(&mut output, thread_id);
+        send_mcp_ready(&mut output, thread_id, native_server);
         if thread_id == "thread-1" { wait_for(&thread_marker); }
         let plugin_request = receive(&mut input, &log);
         assert_plugin_inventory_request(&plugin_request);
@@ -236,7 +237,11 @@ fn main() {
         ) {
             send(&mut output, &format!(r#"{{"id":"native-script","method":"mcpServer/elicitation/request","params":{{"_meta":{{"codex_approval_kind":"mcp_tool_call","persist":["session","always"],"tool_description":"Run JavaScript in a persistent Node-backed kernel.","tool_params":{{"code":"{script}"}},"tool_params_display":[{{"name":"code","display_name":"code","value":"{script}"}}]}},"message":"Allow the node_repl MCP server to run tool \"js\"?","mode":"form","requestedSchema":{{"type":"object","properties":{{}}}},"serverName":"node_repl","threadId":"{thread_id}","turnId":"turn-1"}}}}"#));
             let approval = receive(&mut input, &log);
-            assert!(approval.contains(r#""action":"accept""#));
+            if scenario == "native-task-code-denied" {
+                assert!(approval.contains(r#""action":"decline""#));
+            } else {
+                assert!(approval.contains(r#""action":"accept""#));
+            }
         }
 
         if matches!(
@@ -463,8 +468,8 @@ fn send(output: &mut impl Write, line: &str) {
     output.flush().unwrap();
 }
 
-fn send_mcp_ready(output: &mut impl Write, thread_id: &str) {
-    send(output, &format!(r#"{{"method":"mcpServer/startupStatus/updated","params":{{"threadId":"{thread_id}","name":"computer-use","status":"ready","error":null,"failureReason":null}}}}"#));
+fn send_mcp_ready(output: &mut impl Write, thread_id: &str, server_name: &str) {
+    send(output, &format!(r#"{{"method":"mcpServer/startupStatus/updated","params":{{"threadId":"{thread_id}","name":"{server_name}","status":"ready","error":null,"failureReason":null}}}}"#));
 }
 
 fn assert_plugin_inventory_request(request: &str) {
@@ -654,7 +659,8 @@ struct ScenarioExecution {
     approval_policy: CodexApprovalPolicy,
     sandbox_policy: CodexSandboxPolicy,
     native_apps_allowed: bool,
-    native_app_decision: Option<crate::host::AppApprovalDecision>,
+    native_app_decision: Option<crate::host::NativeApprovalDecision>,
+    native_code_decision: Option<crate::host::NativeApprovalDecision>,
     native_action_evidence: Option<NativeActionEvidence>,
 }
 
@@ -665,6 +671,7 @@ impl ScenarioExecution {
         sandbox_policy: CodexSandboxPolicy::WorkspaceWrite,
         native_apps_allowed: false,
         native_app_decision: None,
+        native_code_decision: None,
         native_action_evidence: None,
     };
 
@@ -674,6 +681,7 @@ impl ScenarioExecution {
         sandbox_policy: CodexSandboxPolicy::DangerFullAccess,
         native_apps_allowed: false,
         native_app_decision: None,
+        native_code_decision: None,
         native_action_evidence: None,
     };
 
@@ -683,6 +691,7 @@ impl ScenarioExecution {
         sandbox_policy: CodexSandboxPolicy::WorkspaceWrite,
         native_apps_allowed: true,
         native_app_decision: None,
+        native_code_decision: Some(crate::host::NativeApprovalDecision::Allow),
         native_action_evidence: None,
     };
 
@@ -697,6 +706,7 @@ impl ScenarioExecution {
             sandbox_policy,
             native_apps_allowed: false,
             native_app_decision: None,
+            native_code_decision: None,
             native_action_evidence: None,
         }
     }
@@ -843,23 +853,24 @@ fn run_scenario_with_options(
     } else {
         BTreeSet::default()
     };
-    let app_approvals = crate::host::app_approval::AppApprovals::default();
-    let mut request_app_approval = |app_id: String, allow_always: bool| {
-        let decision = execution.native_app_decision?;
-        let (request, pending) = app_approvals
-            .request(
-                app_id,
-                allow_always,
-                "operator",
-                None,
-                Instant::now() + timeout,
-            )
+    let native_approvals = crate::host::app_approval::NativeApprovals::default();
+    let mut request_native_approval = |approval_subject: crate::host::NativeApprovalSubject| {
+        let decision = match &approval_subject {
+            crate::host::NativeApprovalSubject::App { .. } => execution.native_app_decision?,
+            crate::host::NativeApprovalSubject::ToolCode { .. } => execution.native_code_decision?,
+        };
+        let (request, pending) = native_approvals
+            .request(approval_subject, "operator", None, Instant::now() + timeout)
             .unwrap();
-        let responder = app_approvals.clone();
+        let responder = native_approvals.clone();
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(20));
             responder
-                .respond(&request.action_request_id, decision)
+                .respond(
+                    &request,
+                    decision,
+                    crate::host::NativeApprovalAuthority::Owner,
+                )
                 .unwrap();
         });
         Some(pending)
@@ -882,9 +893,13 @@ fn run_scenario_with_options(
             persist_thread_ref: &mut persist_thread,
             persist_turn_ref: &mut persist_turn,
             observe_native_approval: Some(&mut observe_native_approval),
-            request_app_approval: Some(&mut request_app_approval),
+            request_native_approval: Some(&mut request_native_approval),
             native_action_evidence: execution.native_action_evidence,
-            expected_mcp_server_name: "computer-use",
+            expected_mcp_server_name: if scenario.starts_with("native-task-") {
+                "node_repl"
+            } else {
+                "computer-use"
+            },
             computer_use_allowed_app_ids: &computer_use_allowed_app_ids,
             control: None,
             goal_set_supported: scenario.starts_with("goal"),
@@ -1070,7 +1085,7 @@ fn provider_child_overrides_are_process_scoped_and_secret_safe() {
             persist_thread_ref: &mut persist_thread,
             persist_turn_ref: &mut persist_turn,
             observe_native_approval: None,
-            request_app_approval: None,
+            request_native_approval: None,
             native_action_evidence: None,
             expected_mcp_server_name: "computer-use",
             computer_use_allowed_app_ids: &BTreeSet::new(),
@@ -1184,7 +1199,7 @@ fn builtin_openai_provider_secret_is_process_scoped_and_shell_excluded() {
             persist_thread_ref: &mut persist_thread,
             persist_turn_ref: &mut persist_turn,
             observe_native_approval: None,
-            request_app_approval: None,
+            request_native_approval: None,
             native_action_evidence: None,
             expected_mcp_server_name: "computer-use",
             computer_use_allowed_app_ids: &BTreeSet::new(),
@@ -1438,7 +1453,7 @@ fn live_interrupt_waits_for_the_durable_stop_acknowledgement() {
         let session_directory = directory.path().to_path_buf();
         let session_thread_marker = thread_marker.clone();
         let session_turn_marker = turn_marker.clone();
-        let approvals = crate::host::app_approval::AppApprovals::default();
+        let approvals = crate::host::app_approval::NativeApprovals::default();
         let session_approvals = approvals.clone();
         let session = std::thread::spawn(move || {
             let mut persist_thread = |_: &str| {
@@ -1449,12 +1464,13 @@ fn live_interrupt_waits_for_the_durable_stop_acknowledgement() {
                 touch(&session_turn_marker);
                 Ok(())
             };
-            let mut request_app_approval = |app_id: String, allow_always: bool| {
-                session_approvals
-                    .request(app_id, allow_always, "operator", None, deadline)
-                    .ok()
-                    .map(|(_, pending)| pending)
-            };
+            let mut request_native_approval =
+                |approval_subject: crate::host::NativeApprovalSubject| {
+                    session_approvals
+                        .request(approval_subject, "operator", None, deadline)
+                        .ok()
+                        .map(|(_, pending)| pending)
+                };
             run_codex_session(
                 command,
                 CodexSessionRequest {
@@ -1472,7 +1488,7 @@ fn live_interrupt_waits_for_the_durable_stop_acknowledgement() {
                     persist_thread_ref: &mut persist_thread,
                     persist_turn_ref: &mut persist_turn,
                     observe_native_approval: None,
-                    request_app_approval: Some(&mut request_app_approval),
+                    request_native_approval: Some(&mut request_native_approval),
                     native_action_evidence: None,
                     expected_mcp_server_name: "computer-use",
                     computer_use_allowed_app_ids: &BTreeSet::new(),
@@ -1488,7 +1504,11 @@ fn live_interrupt_waits_for_the_durable_stop_acknowledgement() {
         });
         wait_for(&turn_marker);
         if scenario == "native-app-pending-interrupt" {
-            while approvals.list().unwrap().is_empty() {
+            while approvals
+                .list(crate::host::NativeApprovalAuthority::Owner)
+                .unwrap()
+                .is_empty()
+            {
                 assert!(
                     Instant::now() < deadline,
                     "app consent must become pending before interruption"
@@ -1511,7 +1531,12 @@ fn live_interrupt_waits_for_the_durable_stop_acknowledgement() {
             session.join().expect("join controlled execution"),
             Ok(CodexSessionTerminal::StoppedByControl)
         );
-        assert!(approvals.list().unwrap().is_empty());
+        assert!(
+            approvals
+                .list(crate::host::NativeApprovalAuthority::Owner)
+                .unwrap()
+                .is_empty()
+        );
     }
 }
 
@@ -1551,7 +1576,7 @@ fn interrupt_before_any_session_claims_control_confirms_inactive_upstream_and_sk
                 persist_thread_ref: &mut persist_thread,
                 persist_turn_ref: &mut persist_turn,
                 observe_native_approval: None,
-                request_app_approval: None,
+                request_native_approval: None,
                 native_action_evidence: None,
                 expected_mcp_server_name: "computer-use",
                 computer_use_allowed_app_ids: &BTreeSet::new(),
@@ -1631,7 +1656,7 @@ fn timed_provider_exchange_requests_correlated_upstream_cancellation() {
             persist_thread_ref: &mut persist_thread,
             persist_turn_ref: &mut persist_turn,
             observe_native_approval: None,
-            request_app_approval: None,
+            request_native_approval: None,
             native_action_evidence: None,
             expected_mcp_server_name: "computer-use",
             computer_use_allowed_app_ids: &BTreeSet::new(),
@@ -1739,7 +1764,7 @@ fn assert_native_action_stop(scenario: &str, failed: bool) {
             persist_thread_ref: &mut persist_thread,
             persist_turn_ref: &mut persist_turn,
             observe_native_approval: None,
-            request_app_approval: None,
+            request_native_approval: None,
             native_action_evidence: None,
             expected_mcp_server_name: "computer-use",
             computer_use_allowed_app_ids: &BTreeSet::new(),
@@ -2071,10 +2096,13 @@ fn an_expired_writer_does_not_mark_turn_dispatch() {
 #[test]
 fn explicit_app_consent_resumes_the_same_protocol_operation() {
     for (scenario, decision) in [
-        ("native-app-allow", crate::host::AppApprovalDecision::Allow),
+        (
+            "native-app-allow",
+            crate::host::NativeApprovalDecision::Allow,
+        ),
         (
             "native-app-always",
-            crate::host::AppApprovalDecision::Always,
+            crate::host::NativeApprovalDecision::Always,
         ),
     ] {
         let result = run_scenario_with_options(
@@ -2100,7 +2128,7 @@ fn explicit_app_consent_resumes_the_same_protocol_operation() {
         assert_eq!(response["result"]["action"], "accept");
         assert_eq!(
             response["result"]["_meta"],
-            if decision == crate::host::AppApprovalDecision::Always {
+            if decision == crate::host::NativeApprovalDecision::Always {
                 json!({"persist":"always"})
             } else {
                 Value::Null

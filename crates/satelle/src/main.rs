@@ -409,7 +409,7 @@ enum Command {
 
 #[derive(Subcommand, Debug)]
 enum ActionCommand {
-    /// Show apps waiting for your consent on the selected Host.
+    /// Show native app access and exact tool code waiting for your consent.
     List(ActionListCommand),
     /// Answer a detached native action request.
     Respond(ActionRespondCommand),
@@ -2678,7 +2678,7 @@ fn execute_command(
         } => respond_to_native_action(command, config).map(|_| None),
         Command::Action {
             command: ActionCommand::List(command),
-        } => show_native_app_approvals(command, config).map(|_| None),
+        } => show_native_approvals(command, config).map(|_| None),
         Command::Queue {
             command: QueueCommand::Status(command),
         } => show_queue_status(command, config, output).map(|_| None),
@@ -16928,29 +16928,39 @@ fn print_queue_status(
     Ok(())
 }
 
-fn show_native_app_approvals(
+fn show_native_approvals(
     command: ActionListCommand,
     config: ConfigContext<'_>,
 ) -> Result<(), CliFailure> {
     let host = config.resolve_host(command.host.as_deref())?;
     let requests = transport::transport_for_session_control(&host)?
-        .app_approval_requests()
+        .native_approval_requests()
         .map_err(failure)?;
     let format = command.output.resolve(EventOutput::None).map_err(failure)?;
     if format.is_structured() {
-        format.print(&json!({"schema_version":"satelle.app-approvals.v1", "host":host.alias, "requests":requests})).map_err(failure)?;
+        format.print(&json!({"schema_version":"satelle.native-approvals.v1", "host":host.alias, "requests":requests})).map_err(failure)?;
     } else {
         for request in requests {
-            println!(
-                "{}: {}{}",
-                request.action_request_id,
-                request.app_id,
-                if request.allow_always {
-                    " (Always allow available)"
-                } else {
-                    ""
-                }
-            );
+            match &request.subject {
+                satelle::host::NativeApprovalSubject::App {
+                    app_id,
+                    allow_always,
+                } => println!(
+                    "{}: app {}{}",
+                    request.action_request_id,
+                    app_id,
+                    if *allow_always {
+                        " (Always allow available)"
+                    } else {
+                        ""
+                    }
+                ),
+                satelle::host::NativeApprovalSubject::ToolCode { code } => println!(
+                    "{}: run node_repl JavaScript once: {}",
+                    request.action_request_id,
+                    serde_json::to_string(code).expect("a code string serializes")
+                ),
+            }
         }
     }
     Ok(())
@@ -16964,16 +16974,16 @@ fn respond_to_native_action(
         .map_err(|error| failure(error.into()))?;
     let host = config.resolve_host(command.host.as_deref())?;
     let decision = if command.deny {
-        satelle::host::AppApprovalDecision::Deny
+        satelle::host::NativeApprovalDecision::Deny
     } else if command.always {
-        satelle::host::AppApprovalDecision::Always
+        satelle::host::NativeApprovalDecision::Always
     } else {
-        satelle::host::AppApprovalDecision::Allow
+        satelle::host::NativeApprovalDecision::Allow
     };
     transport::transport_for_session_control(&host)?
-        .respond_to_app_approval(&id, decision)
+        .respond_to_native_approval(&id, decision)
         .map_err(failure)?;
-    println!("App approval response sent: {id}");
+    println!("Native approval response sent: {id}");
     Ok(())
 }
 

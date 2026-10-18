@@ -87,17 +87,19 @@ pub(super) enum ComputerUseAuthorization {
     Declined,
     App,
     Script(String),
+    CodeApprovalRequired(String),
 }
 
 impl ComputerUseAuthorization {
     pub(super) const fn accepted(&self) -> bool {
-        !matches!(self, Self::Declined)
+        matches!(self, Self::App | Self::Script(_))
     }
 }
 
-/// Accepts only a supported Computer Use prompt bound to either an app in the
-/// canonical allowlist or an exact-Turn script whose app authority was frozen
-/// at admission. Readiness keeps the stricter exact-script and exact-app check.
+/// Accepts supported Computer Use app prompts only for imported app grants.
+/// Generated tool code requires an explicit operator decision. Saved app
+/// access and a live relay never authorize code. Readiness keeps the stricter
+/// Host-owned exact-script and exact-app check.
 pub(super) fn computer_use_elicitation_result(
     object: &Map<String, Value>,
     allowed_app_ids: &BTreeSet<String>,
@@ -123,26 +125,28 @@ pub(super) fn computer_use_elicitation_result(
 
     let app_authorized = (params.get("turnId").is_none_or(Value::is_null) || turn_matches)
         && exact_computer_use_app_prompt(params, allowed_app_ids);
-    let authorized_script = turn_matches
+    let requested_script = turn_matches
         .then(|| validated_computer_use_script(params))
-        .flatten()
-        .filter(|script| {
-            expected_native_action.map_or_else(
-                || !allowed_app_ids.is_empty(),
-                |(expected_script, expected_app_id)| {
-                    // This exact cell is Host-owned readiness code. The SDK
-                    // independently requests explicit app consent before it can
-                    // act; authorization of this code is not an app grant.
-                    !expected_app_id.is_empty()
-                        && *script == expected_script
-                        && (allowed_app_ids.contains(expected_app_id) || app_consent_available)
-                },
-            )
-        });
+        .flatten();
+    let authorized_script = requested_script.filter(|script| {
+        expected_native_action.is_some_and(|(expected_script, expected_app_id)| {
+            // This exact cell is Host-owned readiness code. The SDK
+            // independently requests explicit app consent before it can
+            // act; authorization of this code is not an app grant.
+            !expected_app_id.is_empty()
+                && *script == expected_script
+                && (allowed_app_ids.contains(expected_app_id) || app_consent_available)
+        })
+    });
     let authorization = if app_authorized {
         ComputerUseAuthorization::App
     } else if let Some(script) = authorized_script {
         ComputerUseAuthorization::Script(script.to_owned())
+    } else if expected_native_action.is_none()
+        && app_consent_available
+        && let Some(script) = requested_script
+    {
+        ComputerUseAuthorization::CodeApprovalRequired(script.to_owned())
     } else {
         ComputerUseAuthorization::Declined
     };
@@ -676,7 +680,7 @@ mod tests {
     }
 
     #[test]
-    fn admitted_app_policy_authorizes_a_generated_script_for_the_exact_turn() {
+    fn admitted_app_policy_does_not_authorize_generated_tool_code() {
         let script = "generated native task script";
         let request = computer_use_script_prompt(script, "Use Calculator");
 
@@ -690,9 +694,77 @@ mod tests {
                 false,
             ),
             Ok((
-                json!({"action": "accept", "content": null, "_meta": null}),
-                ComputerUseAuthorization::Script(script.to_string())
+                json!({"action": "decline", "content": null, "_meta": null}),
+                ComputerUseAuthorization::Declined
             ))
+        );
+    }
+
+    #[test]
+    fn native_task_code_requires_explicit_consent_with_or_without_a_relay() {
+        let script = "generated native task script";
+        let request = computer_use_script_prompt(script, "Use Calculator");
+        for broker_available in [false, true] {
+            let (_, authorization) = computer_use_elicitation_result(
+                request.as_object().unwrap(),
+                &BTreeSet::new(),
+                None,
+                Some("thread-1"),
+                Some("turn-1"),
+                broker_available,
+            )
+            .unwrap();
+            assert!(!authorization.accepted());
+            assert_eq!(
+                authorization,
+                if broker_available {
+                    ComputerUseAuthorization::CodeApprovalRequired(script.to_string())
+                } else {
+                    ComputerUseAuthorization::Declined
+                }
+            );
+        }
+        let app = computer_use_app_prompt("com.apple.calculator");
+        let (_, authorization) = computer_use_elicitation_result(
+            app.as_object().unwrap(),
+            &BTreeSet::new(),
+            None,
+            Some("thread-1"),
+            Some("turn-1"),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            authorization,
+            ComputerUseAuthorization::Declined,
+            "a live relay must not grant access to an unapproved app"
+        );
+        for (key, value) in [("turnId", Value::Null), ("serverName", json!("untrusted"))] {
+            let mut changed = request.clone();
+            changed["params"][key] = value;
+            let (_, authorization) = computer_use_elicitation_result(
+                changed.as_object().unwrap(),
+                &BTreeSet::new(),
+                None,
+                Some("thread-1"),
+                Some("turn-1"),
+                true,
+            )
+            .unwrap();
+            assert_eq!(authorization, ComputerUseAuthorization::Declined);
+        }
+        let mut changed = request;
+        changed["params"]["turnId"] = json!("different-turn");
+        assert_eq!(
+            computer_use_elicitation_result(
+                changed.as_object().unwrap(),
+                &BTreeSet::new(),
+                None,
+                Some("thread-1"),
+                Some("turn-1"),
+                true,
+            ),
+            Err(CodexSessionError::ConflictingIdentity)
         );
     }
 
