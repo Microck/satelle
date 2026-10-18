@@ -7215,6 +7215,15 @@ impl SatelleError {
         }
     }
 
+    pub fn macos_app_policy_read_failure(reason: &str) -> Self {
+        let mut error = Self::computer_use_not_ready();
+        error.message = "Satelle could not read saved macOS app approvals; check for a Satelle app-data privacy prompt on the Mac and retry".to_string();
+        error
+            .details
+            .insert("reason".to_string(), Value::String(reason.to_string()));
+        error
+    }
+
     pub fn storage_busy() -> Self {
         Self {
             code: ErrorCode::StorageBusy,

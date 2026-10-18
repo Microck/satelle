@@ -221,13 +221,7 @@ fn read_macos_app_policy_command(
 
 #[cfg(unix)]
 fn macos_app_policy_read_failure(reason: &'static str) -> SatelleError {
-    SatelleError {
-        code: ErrorCode::ComputerUseNotReady,
-        message: "Satelle could not read saved macOS app approvals; check for a Satelle app-data privacy prompt on the Mac and retry".to_string(),
-        recovery_command: Some("satelle doctor --scope computer-use --refresh --json".to_string()),
-        source_detail: None,
-        details: std::collections::BTreeMap::from([("reason".to_string(), Value::String(reason.to_string()))]),
-    }
+    SatelleError::macos_app_policy_read_failure(reason)
 }
 
 fn computer_use_allowed_app_ids_from_config(contents: &str) -> Option<BTreeSet<String>> {

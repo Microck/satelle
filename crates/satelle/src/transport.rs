@@ -9667,7 +9667,12 @@ fn map_computer_use_not_ready_api_error(host: &str, error: &ApiError) -> Satelle
     {
         return SatelleError::remote_api_error(host, "invalid-daemon-response");
     }
-    let mut mapped = SatelleError::computer_use_not_ready();
+    let mut mapped = match details.get("reason").and_then(serde_json::Value::as_str) {
+        Some(
+            reason @ ("macos_app_policy_read_timed_out" | "macos_app_policy_read_unavailable"),
+        ) => SatelleError::macos_app_policy_read_failure(reason),
+        _ => SatelleError::computer_use_not_ready(),
+    };
     mapped.details.extend(details.clone());
     mapped
 }

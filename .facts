@@ -2592,3 +2592,5 @@
 - label: macOS Sky inventory validates official backend capabilities and independently versioned browser cache paths without forwarding browser authority
   command: cargo test --locked -p satelle --lib macos_sky_inventory_accepts_independent_browser_version_without_expanding_access
   tags: [spec, mvp, implemented, ci]
+
+- CLI readiness errors for known macOS saved-approval read failures retain actionable App Data privacy guidance across the Host API boundary, reconstruct trusted text locally, and never echo a remote error message @spec @contract @mvp @implemented
