@@ -2182,6 +2182,9 @@
   tags: [spec, mvp, implemented, ci]
 - satelle may keep a host that lacks native Codex Computer Use only for diagnostics, installation, and repair flows @spec @mvp @implemented
 - satelle host capability checks are OS-aware for Windows, Linux, and macOS instead of assuming one platform's Codex or Computer Use behavior applies to every platform @mvp @implemented
+- label: macOS native Computer Use authenticates the current signed ChatGPT bundle's nested codex-cli/CodexCLI.app/Contents/MacOS/codex executable and rejects redirected CLI identities or a shell wrapper without that executable
+  command: cargo test --locked -p satelle --lib macos_codex_app_layout_rejects_redirected_cli_identity
+  tags: [spec, mvp, implemented, ci]
 - satelle treats cross-platform host support as successful configuration, diagnostics, and capability reporting, not as a guarantee that native Codex Computer Use is available on every operating system @mvp @implemented
 - satelle Computer Use readiness checks verify standalone Codex installation, authentication, native Computer Use availability, required OS permissions, app-server or remote-control startup, and a harmless observable Computer Use action @spec @mvp @implemented
 - satelle Computer Use readiness checks return structured pass/fail reasons for each checked prerequisite @spec @mvp @implemented
@@ -2585,3 +2588,7 @@
 - default-feature library unit tests compile their existing fixtures under cfg(test), while integration-test fixture APIs remain available through the explicit test-support feature; Linux CI checks the default-feature unit-test build alongside all-feature verification @spec @contract @implemented
 
 - the directory-tree dry-run guard registers protected and private barrier directories in one native stream and owns its lifetime exclusively until callbacks are drained; each signal creates a previously absent marker with create-new semantics, only its creation notification acknowledges the barrier, metadata or generic modification events cannot acknowledge a signal, native teardown occurs once after the final barrier, panics release ownership without preventing later independent guards, and transient mutation tests retain exact affected-file assertions @spec @contract @implemented
+
+- label: macOS Sky inventory validates official backend capabilities and independently versioned browser cache paths without forwarding browser authority
+  command: cargo test --locked -p satelle --lib macos_sky_inventory_accepts_independent_browser_version_without_expanding_access
+  tags: [spec, mvp, implemented, ci]

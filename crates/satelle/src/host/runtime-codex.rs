@@ -45,8 +45,9 @@ const COMPUTER_USE_PLUGIN_ID: &str = "computer-use@openai-bundled";
 const MACOS_CODEX_APP_ID: &str = "com.openai.codex";
 #[cfg(target_os = "macos")]
 const MACOS_CODEX_CLI_ID: &str = "codex";
-#[cfg(target_os = "macos")]
 const MACOS_CODEX_APP_PATH: &str = "/Applications/ChatGPT.app";
+const MACOS_CODEX_CLI_RELATIVE_PATH: &str =
+    "Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex";
 const MACOS_NODE_REPL_ROOT: &str = "/Applications/ChatGPT.app/Contents/Resources/cua_node";
 #[cfg(target_os = "macos")]
 const MACOS_NATIVE_BRIDGE_LAUNCHER: &str = "__satelle-launch-macos-native-bridge";
@@ -2169,7 +2170,9 @@ pub(super) fn validate_macos_codex_app_layout(bundle: &Path) -> Result<PathBuf, 
     {
         return Err(codex_isolation_error("codex_app_runtime_untrusted"));
     }
-    let executable = bundle.join("Contents").join("Resources").join("codex");
+    // The desktop bundle also contains a shell wrapper in codex-cli/bin.
+    // Execute the signed Mach-O directly so its identity remains attestable.
+    let executable = bundle.join(MACOS_CODEX_CLI_RELATIVE_PATH);
     let executable_metadata = fs::symlink_metadata(&executable).map_err(|error| {
         codex_isolation_path_error(
             error,
@@ -2186,7 +2189,7 @@ pub(super) fn validate_macos_codex_app_layout(bundle: &Path) -> Result<PathBuf, 
     })?;
     if !executable_metadata.is_file()
         || executable_metadata.file_type().is_symlink()
-        || canonical_executable != canonical_bundle.join("Contents/Resources/codex")
+        || canonical_executable != canonical_bundle.join(MACOS_CODEX_CLI_RELATIVE_PATH)
     {
         return Err(codex_isolation_error("codex_app_runtime_untrusted"));
     }
@@ -2988,6 +2991,18 @@ fn trusted_native_mcp_binding(
     }
 }
 
+fn native_inventory_backends_are_valid(backends: &str) -> bool {
+    let names = backends
+        .split(',')
+        .collect::<std::collections::BTreeSet<_>>();
+    names.len() == backends.split(',').count()
+        && names.contains("chrome")
+        && names.contains("iab")
+        && names
+            .iter()
+            .all(|name| matches!(*name, "chrome" | "iab" | "mcpapps"))
+}
+
 pub(super) fn trusted_macos_node_repl_env(
     reported_env: &BTreeMap<String, String>,
     codex_home: &Path,
@@ -3011,17 +3026,29 @@ pub(super) fn trusted_macos_node_repl_env(
         codex_home.trim_end_matches('/')
     );
     let node_modules = format!("{trusted_root}/lib/node_modules");
-    let browser_service = format!(
-        "{}/plugins/cache/openai-bundled/browser/{app_version}/scripts/browser-service.mjs",
+    let browser_prefix = format!(
+        "{}/plugins/cache/openai-bundled/browser/",
         codex_home.trim_end_matches('/')
     );
     let trusted_services =
         serde_json::from_str::<Value>(reported_env.get("NODE_REPL_TRUSTED_SERVICES")?).ok()?;
     let trusted_services = trusted_services.as_object()?;
+    // Desktop and cached browser plugins update independently. Browser
+    // authority is discarded below, but its inventory path must stay closed.
+    let browser_version = trusted_services
+        .get("browser")?
+        .as_str()?
+        .strip_prefix(&browser_prefix)?
+        .strip_suffix("/scripts/browser-service.mjs")?;
     if trusted_services.len() != 2
-        || trusted_services.get("browser").and_then(Value::as_str) != Some(browser_service.as_str())
+        || !component_version_is_valid(browser_version)
         || trusted_services.get("sky").and_then(Value::as_str) != Some("@oai/sky/service")
     {
+        return None;
+    }
+
+    let backends = reported_env.get("BROWSER_USE_AVAILABLE_BACKENDS")?;
+    if !native_inventory_backends_are_valid(backends) {
         return None;
     }
 
@@ -3045,7 +3072,7 @@ pub(super) fn trusted_macos_node_repl_env(
         ),
         (
             "BROWSER_USE_AVAILABLE_BACKENDS".to_string(),
-            "chrome,iab".to_string(),
+            backends.clone(),
         ),
         (
             "BROWSER_USE_TINYSKY_ENABLED".to_string(),
@@ -3058,7 +3085,7 @@ pub(super) fn trusted_macos_node_repl_env(
         ),
         (
             "CODEX_CLI_PATH".to_string(),
-            "/Applications/ChatGPT.app/Contents/Resources/codex".to_string(),
+            format!("{MACOS_CODEX_APP_PATH}/{MACOS_CODEX_CLI_RELATIVE_PATH}"),
         ),
         ("SKY_CUA_SERVICE_PATH".to_string(), computer_use_service),
     ]);
@@ -3078,6 +3105,10 @@ pub(super) fn trusted_macos_node_repl_env(
     }
 
     let mut admitted_env = expected_runtime_env;
+    admitted_env.insert(
+        "BROWSER_USE_AVAILABLE_BACKENDS".to_string(),
+        "chrome,iab".to_string(),
+    );
     admitted_env.insert(
         "NODE_REPL_TRUSTED_SERVICES".to_string(),
         r#"{"sky":"@oai/sky/service"}"#.to_string(),
@@ -3115,16 +3146,7 @@ pub(super) fn trusted_windows_node_repl_env(
     // Inventory capabilities are a set; only the isolated Sky runtime's
     // admitted backends are forwarded below, regardless of desktop ordering.
     let backends = reported_env.get("BROWSER_USE_AVAILABLE_BACKENDS")?;
-    let backend_names = backends
-        .split(',')
-        .collect::<std::collections::BTreeSet<_>>();
-    if backend_names.len() != backends.split(',').count()
-        || !backend_names.contains("chrome")
-        || !backend_names.contains("iab")
-        || !backend_names
-            .iter()
-            .all(|name| matches!(*name, "chrome" | "iab" | "mcpapps"))
-    {
+    if !native_inventory_backends_are_valid(backends) {
         return None;
     }
     if reported_env.get("NODE_REPL_UNTRUSTED_ENV_ALLOWLIST")? != "CODEX_WINDOWS_REGISTERED_CORE"

@@ -101,7 +101,7 @@ fn macos_native_bridge_env() -> BTreeMap<String, String> {
         ),
         (
             "CODEX_CLI_PATH".to_string(),
-            "/Applications/ChatGPT.app/Contents/Resources/codex".to_string(),
+            "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex".to_string(),
         ),
         (
             "SKY_CUA_SERVICE_PATH".to_string(),
@@ -1721,6 +1721,66 @@ fn macos_sky_environment_preserves_runtime_values_and_discards_instructions() {
 }
 
 #[test]
+fn macos_sky_inventory_accepts_independent_browser_version_without_expanding_access() {
+    for backends in ["chrome,iab", "chrome,iab,mcpapps", "mcpapps,iab,chrome"] {
+        let mut reported = macos_native_bridge_env();
+        reported.insert(
+            "BROWSER_USE_AVAILABLE_BACKENDS".to_string(),
+            backends.to_string(),
+        );
+        reported.insert(
+            "NODE_REPL_TRUSTED_SERVICES".to_string(),
+            r#"{"browser":"/Users/operator/.codex/plugins/cache/openai-bundled/browser/26.930.61225/scripts/browser-service.mjs","sky":"@oai/sky/service"}"#.to_string(),
+        );
+        let admitted = trusted_macos_node_repl_env(
+            &reported,
+            Path::new("/Users/operator/.codex"),
+            Path::new("/Applications/ChatGPT.app/Contents/Resources/cua_node"),
+        )
+        .expect("independent browser version and official backend capabilities must be admitted");
+        assert_eq!(admitted["BROWSER_USE_AVAILABLE_BACKENDS"], "chrome,iab");
+        assert_eq!(
+            admitted["NODE_REPL_TRUSTED_SERVICES"],
+            r#"{"sky":"@oai/sky/service"}"#
+        );
+    }
+    for backends in ["", "chrome", "chrome,iab,unknown", "chrome,iab,iab"] {
+        let mut reported = macos_native_bridge_env();
+        reported.insert(
+            "BROWSER_USE_AVAILABLE_BACKENDS".to_string(),
+            backends.to_string(),
+        );
+        assert!(
+            trusted_macos_node_repl_env(
+                &reported,
+                Path::new("/Users/operator/.codex"),
+                Path::new("/Applications/ChatGPT.app/Contents/Resources/cua_node"),
+            )
+            .is_none()
+        );
+    }
+    for browser in [
+        "/tmp/browser-service.mjs",
+        "/Users/operator/.codex/plugins/cache/openai-bundled/browser/../scripts/browser-service.mjs",
+        "/Users/operator/.codex/plugins/cache/openai-bundled/browser/27.1.0/extra/scripts/browser-service.mjs",
+    ] {
+        let mut reported = macos_native_bridge_env();
+        reported.insert(
+            "NODE_REPL_TRUSTED_SERVICES".to_string(),
+            json!({"browser": browser, "sky": "@oai/sky/service"}).to_string(),
+        );
+        assert!(
+            trusted_macos_node_repl_env(
+                &reported,
+                Path::new("/Users/operator/.codex"),
+                Path::new("/Applications/ChatGPT.app/Contents/Resources/cua_node"),
+            )
+            .is_none()
+        );
+    }
+}
+
+#[test]
 fn macos_sky_service_path_rejects_missing_redirected_or_extra_values() {
     type EnvironmentMutation = fn(&mut BTreeMap<String, String>);
     let mutations: [(&str, EnvironmentMutation); 4] = [
@@ -2010,10 +2070,10 @@ fn macos_codex_app_layout_rejects_redirected_cli_identity() {
     // the embedded CLI identity instead of failing on the parent alias.
     let fixture_root =
         std::fs::canonicalize(directory.path()).expect("canonicalize macOS fixture root");
-    let bundle = fixture_root.join("Codex.app");
-    let resources = bundle.join("Contents").join("Resources");
-    std::fs::create_dir_all(&resources).expect("create exact Codex app layout");
-    let executable = resources.join("codex");
+    let bundle = fixture_root.join("ChatGPT.app");
+    let executable = bundle.join("Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex");
+    std::fs::create_dir_all(executable.parent().expect("nested CLI parent"))
+        .expect("create current signed Codex CLI app layout");
     std::fs::write(&executable, "fixture").expect("write embedded Codex fixture");
     assert_eq!(
         validate_macos_codex_app_layout(&bundle)
@@ -2022,8 +2082,12 @@ fn macos_codex_app_layout_rejects_redirected_cli_identity() {
     );
 
     std::fs::remove_file(&executable).expect("remove regular embedded Codex fixture");
+    let wrapper = bundle.join("Contents/Resources/codex-cli/bin/codex");
+    std::fs::create_dir_all(wrapper.parent().expect("wrapper parent"))
+        .expect("create desktop CLI wrapper directory");
+    std::fs::write(&wrapper, "#!/bin/sh\n").expect("write desktop CLI shell wrapper");
     let missing = validate_macos_codex_app_layout(&bundle)
-        .expect_err("a missing embedded Codex CLI requires manual setup");
+        .expect_err("a shell wrapper cannot replace the signed embedded CLI");
     assert_eq!(
         missing.details["reason"],
         json!("codex_app_runtime_missing")
@@ -2074,13 +2138,15 @@ fn macos_computer_use_runtime_uses_the_desktop_bundles_embedded_codex() {
     // substitute the signed desktop binary, but it must keep that exact home.
     let receipt_codex_home = Path::new("/Users/operator/.codex");
     let command = macos_codex_app_command(
-        Path::new("/Applications/ChatGPT.app/Contents/Resources/codex"),
+        Path::new(
+            "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+        ),
         receipt_codex_home,
     );
 
     assert_eq!(
         command.get_program(),
-        "/Applications/ChatGPT.app/Contents/Resources/codex"
+        "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex"
     );
     assert_eq!(
         command.get_envs().collect::<Vec<_>>(),
@@ -2146,7 +2212,7 @@ fn isolation_rejects_application_shaped_bridges_outside_the_official_roots() {
                     "NODE_REPL_INSTRUCTIONS_USE_CASE_CHROME": "Control the Chrome browser in conjunction with the Chrome Plugin. Prefer this method of controlling Chrome over alternatives (such as Computer Use) unless the user explicitly mentions an alternative.",
                     "NODE_REPL_INSTRUCTIONS_USE_CASE_COMPUTER_USE": "Control desktop apps on macOS through Computer Use.",
                     "BROWSER_USE_CODEX_APP_BUILD_FLAVOR": "prod",
-                    "CODEX_CLI_PATH": "/Applications/ChatGPT.app/Contents/Resources/codex",
+                    "CODEX_CLI_PATH": "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
                     "NODE_REPL_TRUSTED_SERVICES": "{\"browser\":\"/Users/operator/.codex/plugins/cache/openai-bundled/browser/26.730.61639/scripts/browser-service.mjs\",\"sky\":\"@oai/sky/service\"}"
                 }),
             )
