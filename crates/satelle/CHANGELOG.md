@@ -1,3 +1,9 @@
+## satelle@0.1.39
+
+### Current macOS Computer Use runtime
+
+Use the signed CLI in the current ChatGPT desktop bundle. Accept official backend capabilities and independently versioned browser cache paths while keeping native execution limited to Sky. Publisher verification, app consent and redirected-path checks remain enforced.
+
 ## satelle@0.1.38
 
 ### Completed setup recovery

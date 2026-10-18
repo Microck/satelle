@@ -188,6 +188,7 @@ for (const state of ['missing', 'unauthenticated', 'authenticated']) {
     const directory = mkdtempSync(join(tmpdir(), 'satelle-preflight-'));
     try {
       const log = join(directory, 'calls');
+      symlinkSync('/bin/sleep', join(directory, 'sleep'));
       writeFileSync(join(directory, 'jq'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
       if (state !== 'missing') {
         writeFileSync(join(directory, 'gh'), `#!/bin/sh\nprintf '%s\\n' "$*" >> "$GH_CALL_LOG"\n[ "$*" = 'auth status' ] || exit 99\nexit ${state === 'authenticated' ? 0 : 1}\n`, { mode: 0o755 });
