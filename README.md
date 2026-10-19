@@ -141,7 +141,7 @@ The Rust CLI and Host do not depend on the documentation application. Node.js
 20.9 or newer is needed only for repository checks and the Fumadocs site.
 
 ```sh
-cargo test --workspace --locked
+cargo test --workspace --all-targets --all-features --locked
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 npm test
 npm run docs:build
