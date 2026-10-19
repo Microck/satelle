@@ -26,10 +26,10 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
-      - name: Install minimum supported Node.js
+      - name: Install repository tooling Node.js
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
         with:
-          node-version: 18
+          node-version: 24.8.0
           cache: npm
 
       - name: Install pnpm
@@ -56,10 +56,15 @@ jobs:
       - name: Check release metadata
         run: npm run release:check
 
-      - name: Check npm distribution
+      - name: Install published npm launcher minimum Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: 18
+
+      - name: Check npm distribution on its published Node 18 floor
         env:
           SATELLE_REQUIRED_PACKAGE_MANAGERS: npm,pnpm,bun
-        run: npm run check:npm
+        run: node --test npm/test/npm-distribution.test.cjs npm/test/package-managers.test.cjs npm/test/release-followup.test.cjs npm/test/release-infrastructure.test.cjs npm/test/output-format-conformance.test.cjs
 
   rust:
     name: Rust quality gates (${{ matrix.os }})
