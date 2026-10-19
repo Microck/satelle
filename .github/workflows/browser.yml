@@ -14,6 +14,8 @@ jobs:
         working-directory: website
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@v4
         with:
           node-version: 24
@@ -29,5 +31,6 @@ jobs:
         with:
           name: documentation-browser-failure-traces
           path: website/.e2e/results/
+          include-hidden-files: true
           retention-days: 7
           if-no-files-found: ignore
