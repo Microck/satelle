@@ -6,7 +6,7 @@
     "website"
   ],
   "engines": {
-    "node": ">=20.9.0"
+    "node": ">=24.8.0"
   },
   "scripts": {
     "check:npm": "node --test npm/test/npm-distribution.test.cjs npm/test/package-managers.test.cjs npm/test/release-followup.test.cjs npm/test/release-infrastructure.test.cjs npm/test/output-format-conformance.test.cjs",
