@@ -1,0 +1,20 @@
+import { readFileSync,readdirSync } from "node:fs";
+import { join, relative, sep } from "node:path";
+import { test } from "@e2e-dev/web";
+import { expect } from "e2e";
+const root="../docs";
+function pages(directory=root):{route:string;title:string}[]{
+ return readdirSync(directory,{withFileTypes:true}).flatMap(entry=>{
+  const path=join(directory,entry.name);
+  if(entry.isDirectory())return entry.name==="reviews"?[]:pages(path);
+  if(!/\.mdx?$/.test(entry.name))return [];
+  const frontmatter=readFileSync(path,"utf8").match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/)?.[1] ?? "";
+  const title=frontmatter.match(/^title:\s*(.+?)\s*$/m)?.[1]?.replace(/^(["'])(.*)\1$/, "$2");
+  if(!title)throw new Error(`Missing title: ${path}`);
+  return [{route:"/docs/"+relative(root,path).split(sep).join("/").replace(/\.mdx?$/,"").replace(/(^|\/)index$/,""),title}];
+ });
+}
+for(const page of pages())test(`documentation ${page.route}`,async({app,screen})=>{
+ await app.open(page.route);
+ await expect(screen.getByRole("heading",{name:page.title,exact:true})).toBeVisible();
+});
