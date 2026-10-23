@@ -5168,7 +5168,8 @@ fn parse_launchd_service_definition(
     const QUEUE_PREFIX: &str = "<string>--queue-config-json</string><string>";
     const ENVIRONMENT_PREFIX: &str = "</array><key>EnvironmentVariables</key><dict>";
     const SUFFIX: &str = concat!(
-        "</dict><key>RunAtLoad</key><true/><key>KeepAlive</key><true/>",
+        "</dict><key>RunAtLoad</key><true/><key>KeepAlive</key>",
+        "<dict><key>SuccessfulExit</key><false/></dict>",
         "</dict></plist>",
     );
     let text =
@@ -9269,6 +9270,18 @@ try {{
             .expect("valid launchd service config");
         assert_eq!(parsed.state_dir, overrides.state_dir);
         assert_eq!(parsed.log_dir, overrides.log_dir);
+
+        // A service that respawns after a clean handoff is not the canonical service.
+        for restart_policy in ["<true/>", "<dict><key>SuccessfulExit</key><true/></dict>"] {
+            let wrong_restart = plist.replace(
+                "<dict><key>SuccessfulExit</key><false/></dict>",
+                restart_policy,
+            );
+            assert!(
+                parse_service_path_overrides(RemoteTarget::DarwinArm64, wrong_restart.as_bytes())
+                    .is_err()
+            );
+        }
 
         let unknown_key = plist.replace(
             "<key>EnvironmentVariables</key><dict>",
