@@ -1,3 +1,17 @@
+## satelle@0.1.40
+
+### macOS Host service
+
+Keep Satelle stopped after an intentional clean exit so setup can replace the Host without launchd starting the old process again. Restart after unexpected failure.
+
+### Windows Computer Use
+
+Accept the current official Codex desktop runtime declaration while preserving native-only execution and protected helper verification. This fixes the native inventory trust rejection; it does not resolve native screenshot capture failures.
+
+### Diagnostic timeouts
+
+Honor an explicit Doctor timeout across selected probes and their prerequisites. A longer refresh no longer reports an otherwise reachable Host as unreachable because the HTTP deadline expired first.
+
 ## satelle@0.1.39
 
 ### Current macOS Computer Use runtime
