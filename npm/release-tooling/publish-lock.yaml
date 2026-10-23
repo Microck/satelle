@@ -1,6 +1,6 @@
 core:changelogs:
-  - content: "---\npackages:\n  cargo:satelle:\n    type: patch\n---\n\n## Complete release publication\n\nThe 0.1.40 npm and GitHub release did not finish publication. Use 0.1.41 for the complete release across installation channels.\n\n## Host recovery and diagnostics\n\nThis release includes the macOS clean-exit service fix, current Windows native inventory support and explicit Doctor timeout handling from 0.1.40. The Windows inventory fix clears native trust rejection; native screenshot capture still requires live device verification.\n"
-    filename: release-publication-recovery.md
+  - content: "---\npackages:\n  cargo:satelle:\n    type: patch\n---\n\n## macOS Host lifecycle\n\nStop and restart the persistent Host from the default macOS shell without reporting an otherwise reachable Host as unreachable.\n\n## Current macOS Computer Use runtime\n\nAccept the current official desktop bridge declaration while keeping native sessions isolated from browser access. Signed executable, service and runtime checks remain enforced. Native app access and macOS privacy permissions still require their own grants.\n"
+    filename: macos-native-readiness.md
     v: 0.0.0
 core:packages:
   - id: npm:satelle-repository
@@ -8,7 +8,7 @@ core:packages:
   - id: npm:satelle-docs
     updated: false
   - changelogIds:
-      - release-publication-recovery.md
+      - macos-native-readiness.md
     id: cargo:satelle
     updated: true
 npm:packages:
