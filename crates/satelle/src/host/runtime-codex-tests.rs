@@ -50,6 +50,14 @@ fn fixture_computer_use_plugin_root(platform: &str) -> &'static Path {
     }
 }
 
+fn macos_native_inventory_env_vars() -> [&'static str; 3] {
+    [
+        "BROWSER_USE_ACCESS_EXECUTOR_ID",
+        "BROWSER_USE_ACCESS_PIPE_PATH",
+        "BROWSER_USE_ACCESS_VERIFYING_IDENTITY",
+    ]
+}
+
 fn macos_native_bridge_env() -> BTreeMap<String, String> {
     BTreeMap::from([
         (
@@ -1876,6 +1884,7 @@ fn macos_isolation_selects_the_official_node_repl_path() {
                 "type": "stdio",
                 "command": "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl",
                 "args": [],
+                "env_vars": macos_native_inventory_env_vars(),
                 "env": macos_native_bridge_env()
             }
         }
@@ -1892,6 +1901,10 @@ fn macos_isolation_selects_the_official_node_repl_path() {
     )
     .expect("the official macOS node_repl path must be admitted");
 
+    assert!(plan.native_mcp_binding.env_vars.is_empty());
+    for name in macos_native_inventory_env_vars() {
+        assert!(!plan.native_mcp_binding.env.contains_key(name));
+    }
     assert_eq!(plan.native_mcp_server_name, "node_repl");
     assert_eq!(plan.plugin_version, "2.0.0");
     assert_eq!(plan.disabled_mcp_server_names, ["computer-use"]);
@@ -1911,6 +1924,52 @@ fn macos_isolation_selects_the_official_node_repl_path() {
         plan.native_mcp_binding.env["SKY_CUA_SERVICE_PATH"],
         "/Users/operator/.codex/computer-use/Codex Computer Use.app"
     );
+
+    // Inventory ordering does not change authority; old or widened
+    // declarations must fail instead of admitting arbitrary inheritance.
+    let mut inherited_names = macos_native_inventory_env_vars();
+    inherited_names.reverse();
+    mcp_inventory[1]["transport"]["env_vars"] = json!(inherited_names);
+    codex_isolation_plan_from_json(
+        &plugins,
+        &serde_json::to_vec(&mcp_inventory).unwrap(),
+        "macos",
+        Path::new("/Users/operator/.codex"),
+        fixture_computer_use_plugin_root("macos"),
+        Path::new("/Applications/ChatGPT.app/Contents/Resources/cua_node"),
+    )
+    .expect("current desktop inheritance is order independent");
+    for inherited_names in [
+        json!([]),
+        json!([
+            "BROWSER_USE_ACCESS_EXECUTOR_ID",
+            "BROWSER_USE_ACCESS_PIPE_PATH"
+        ]),
+        json!([
+            "BROWSER_USE_ACCESS_EXECUTOR_ID",
+            "BROWSER_USE_ACCESS_EXECUTOR_ID",
+            "BROWSER_USE_ACCESS_VERIFYING_IDENTITY"
+        ]),
+        json!([
+            "BROWSER_USE_ACCESS_EXECUTOR_ID",
+            "BROWSER_USE_ACCESS_PIPE_PATH",
+            "BROWSER_USE_ACCESS_VERIFYING_IDENTITY",
+            "OPENAI_API_KEY"
+        ]),
+    ] {
+        mcp_inventory[1]["transport"]["env_vars"] = inherited_names;
+        let error = codex_isolation_plan_from_json(
+            &plugins,
+            &serde_json::to_vec(&mcp_inventory).unwrap(),
+            "macos",
+            Path::new("/Users/operator/.codex"),
+            fixture_computer_use_plugin_root("macos"),
+            Path::new("/Applications/ChatGPT.app/Contents/Resources/cua_node"),
+        )
+        .expect_err("missing, duplicate or extra inherited names must fail closed");
+        assert_eq!(error.details["reason"], json!("native_bridge_untrusted"));
+    }
+    mcp_inventory[1]["transport"]["env_vars"] = json!(macos_native_inventory_env_vars());
 
     let mut embedded_plugins: serde_json::Value =
         serde_json::from_slice(&plugins).expect("parse plugin fixture");
@@ -2257,7 +2316,7 @@ fn isolation_rejects_application_shaped_bridges_outside_the_official_roots() {
                 "type": "stdio",
                 "command": command,
                 "args": args,
-                "env_vars": if platform == "windows" { json!(windows_native_inventory_env_vars()) } else { json!([]) },
+                "env_vars": if platform == "windows" { json!(windows_native_inventory_env_vars()) } else { json!(macos_native_inventory_env_vars()) },
                 "env": env
             }
         }]))

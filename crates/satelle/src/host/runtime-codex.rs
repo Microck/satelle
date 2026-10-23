@@ -2920,9 +2920,16 @@ pub(super) fn native_bridge_root_path(platform: &str, _codex_home: &Path) -> Opt
     }
 }
 
-// The shared desktop inventory includes browser access, while Satelle's isolated
-// native binding below inherits only the registered core. Setup must write the
-// same declaration that admission validates.
+// The macOS desktop shares this bridge with browser access. Admission validates
+// this declaration but drops every inherited name from isolated native sessions.
+const MACOS_NATIVE_INVENTORY_ENV_VARS: [&str; 3] = [
+    "BROWSER_USE_ACCESS_EXECUTOR_ID",
+    "BROWSER_USE_ACCESS_PIPE_PATH",
+    "BROWSER_USE_ACCESS_VERIFYING_IDENTITY",
+];
+
+// Windows setup persists the same declaration that admission validates. Only
+// the registered native core is inherited by the isolated Windows binding.
 const WINDOWS_NATIVE_INVENTORY_ENV_VARS: [&str; 4] = [
     "BROWSER_USE_ACCESS_EXECUTOR_ID",
     "BROWSER_USE_ACCESS_PIPE_PATH",
@@ -2981,7 +2988,12 @@ fn trusted_native_mcp_binding(
             })
         }
         "macos" => {
-            if !server.transport.env_vars.is_empty()
+            // Validate the desktop's shared browser declaration, then discard
+            // inheritance below so the isolated bridge receives native access only.
+            if server.transport.env_vars.len() != MACOS_NATIVE_INVENTORY_ENV_VARS.len()
+                || !MACOS_NATIVE_INVENTORY_ENV_VARS
+                    .iter()
+                    .all(|name| server.transport.env_vars.iter().any(|value| value == name))
                 || !server.transport.args.is_empty()
                 || server.transport.cwd.is_some()
                 || !trusted_macos_node_repl_path(Path::new(command), trusted_root)
