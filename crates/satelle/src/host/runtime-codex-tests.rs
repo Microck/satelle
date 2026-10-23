@@ -247,6 +247,16 @@ fn macos_runtime_identity_binds_every_authenticated_native_executable() {
     assert_eq!(key.native_runtime_version(), identity);
 }
 
+// Captured from the official Windows desktop inventory, app 26.1016.61520.
+fn windows_native_inventory_env_vars() -> [&'static str; 4] {
+    [
+        "BROWSER_USE_ACCESS_EXECUTOR_ID",
+        "BROWSER_USE_ACCESS_PIPE_PATH",
+        "BROWSER_USE_ACCESS_VERIFYING_IDENTITY",
+        "CODEX_WINDOWS_REGISTERED_CORE",
+    ]
+}
+
 fn windows_native_bridge_env() -> BTreeMap<String, String> {
     BTreeMap::from([
         (
@@ -1391,11 +1401,16 @@ fn isolation_preserves_only_the_validated_official_computer_use_path() {
                 "type": "stdio",
                 "command": "C:\\Users\\operator\\AppData\\Local\\OpenAI\\Codex\\runtimes\\cua_node\\f1359d6e9a17bb1d\\bin\\node_repl.exe",
                 "args": [],
-                "env_vars": ["CODEX_WINDOWS_REGISTERED_CORE"],
+                "env_vars": windows_native_inventory_env_vars(),
                 "env": windows_native_bridge_env()
             }
         }
     ]);
+    // Inventory ordering does not change the declared authority.
+    mcp_inventory[1]["transport"]["env_vars"]
+        .as_array_mut()
+        .expect("inventory environment names")
+        .reverse();
     let mcp_servers = serde_json::to_vec(&mcp_inventory).expect("serialize MCP fixture");
 
     let plan = codex_isolation_plan_from_json(
@@ -1428,7 +1443,13 @@ fn isolation_preserves_only_the_validated_official_computer_use_path() {
     );
     assert_eq!(plan.disabled_mcp_server_names, ["paper"]);
 
+    let mut extra_env_vars = windows_native_inventory_env_vars().to_vec();
+    extra_env_vars.push("OPENAI_API_KEY");
+    let mut duplicate_env_vars = windows_native_inventory_env_vars();
+    duplicate_env_vars[0] = "CODEX_WINDOWS_REGISTERED_CORE";
     for inherited_names in [
+        json!(extra_env_vars),
+        json!(duplicate_env_vars),
         json!([]),
         json!(["OPENAI_API_KEY"]),
         json!(["CODEX_WINDOWS_REGISTERED_CORE", "OPENAI_API_KEY"]),
@@ -1449,7 +1470,7 @@ fn isolation_preserves_only_the_validated_official_computer_use_path() {
         .expect_err("only the official registered core may be inherited");
         assert_eq!(error.details["reason"], json!("native_bridge_untrusted"));
     }
-    mcp_inventory[1]["transport"]["env_vars"] = json!(["CODEX_WINDOWS_REGISTERED_CORE"]);
+    mcp_inventory[1]["transport"]["env_vars"] = json!(windows_native_inventory_env_vars());
 
     mcp_inventory[1]["transport"]["cwd"] = json!("C:\\Users\\operator");
     let error = codex_isolation_plan_from_json(
@@ -1514,7 +1535,7 @@ fn isolation_rejects_incomplete_or_tampered_windows_bridge_environment() {
                 "type": "stdio",
                 "command": "C:\\Users\\operator\\AppData\\Local\\OpenAI\\Codex\\runtimes\\cua_node\\f1359d6e9a17bb1d\\bin\\node_repl.exe",
                 "args": [],
-                "env_vars": ["CODEX_WINDOWS_REGISTERED_CORE"],
+                "env_vars": windows_native_inventory_env_vars(),
                 "env": env
             }
         }]))
@@ -2233,7 +2254,7 @@ fn isolation_rejects_application_shaped_bridges_outside_the_official_roots() {
                 "type": "stdio",
                 "command": command,
                 "args": args,
-                "env_vars": if platform == "windows" { json!(["CODEX_WINDOWS_REGISTERED_CORE"]) } else { json!([]) },
+                "env_vars": if platform == "windows" { json!(windows_native_inventory_env_vars()) } else { json!([]) },
                 "env": env
             }
         }]))

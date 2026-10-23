@@ -2931,7 +2931,18 @@ fn trusted_native_mcp_binding(
 
     match platform {
         "windows" => {
-            if server.transport.env_vars != ["CODEX_WINDOWS_REGISTERED_CORE"]
+            // The desktop shares this bridge with browser access. Validate its
+            // declaration, then retain only native authority in the binding below.
+            let inventory_env_vars = [
+                "BROWSER_USE_ACCESS_EXECUTOR_ID",
+                "BROWSER_USE_ACCESS_PIPE_PATH",
+                "BROWSER_USE_ACCESS_VERIFYING_IDENTITY",
+                "CODEX_WINDOWS_REGISTERED_CORE",
+            ];
+            if server.transport.env_vars.len() != inventory_env_vars.len()
+                || !inventory_env_vars
+                    .iter()
+                    .all(|name| server.transport.env_vars.iter().any(|value| value == name))
                 || !server.transport.args.is_empty()
                 || server.transport.cwd.is_some()
                 || !trusted_windows_bridge_path(Path::new(command), trusted_root)
@@ -2959,7 +2970,7 @@ fn trusted_native_mcp_binding(
             Some(NativeMcpBinding {
                 command: command.to_string(),
                 args: server.transport.args.clone(),
-                env_vars: server.transport.env_vars.clone(),
+                env_vars: vec!["CODEX_WINDOWS_REGISTERED_CORE".to_string()],
                 env,
             })
         }
