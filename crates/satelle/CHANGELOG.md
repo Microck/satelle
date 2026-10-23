@@ -1,3 +1,13 @@
+## satelle@0.1.42
+
+### macOS Host lifecycle
+
+Stop and restart the persistent Host from the default macOS shell without reporting an otherwise reachable Host as unreachable.
+
+### Current macOS Computer Use runtime
+
+Accept the current official desktop bridge declaration while keeping native sessions isolated from browser access. Signed executable, service and runtime checks remain enforced. Native app access and macOS privacy permissions still require their own grants.
+
 ## satelle@0.1.41
 
 ### Complete release publication
