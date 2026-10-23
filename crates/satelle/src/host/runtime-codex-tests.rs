@@ -911,7 +911,7 @@ fn handshake_ignores_unknown_notifications() {
 }
 
 #[test]
-fn windows_native_config_persists_core_inheritance_without_changing_user_state() {
+fn windows_native_config_persists_current_inventory_without_changing_user_state() {
     let contents = r#"
 model = "gpt-6-luna"
 [computer_use.windows]
@@ -933,9 +933,12 @@ NODE_REPL_UNTRUSTED_ENV_ALLOWLIST = "CODEX_WINDOWS_REGISTERED_CORE"
         .unwrap();
     assert_eq!(
         inherited,
-        toml::Value::Array(vec![toml::Value::String(
-            "CODEX_WINDOWS_REGISTERED_CORE".to_string()
-        )])
+        toml::Value::Array(
+            windows_native_inventory_env_vars()
+                .into_iter()
+                .map(|name| toml::Value::String(name.to_string()))
+                .collect()
+        )
     );
     assert_eq!(after, before);
     assert!(

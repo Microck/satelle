@@ -934,10 +934,12 @@ pub(super) fn windows_config_with_native_binding(
         .and_then(toml_edit::Item::as_table_like_mut)
         .ok_or_else(|| codex_isolation_error("native_bridge_inventory_untrusted"))?;
     // `codex mcp add` can persist explicit env values but has no env_vars flag.
-    // Keep the provider-owned core inheritance declaration in the managed home
-    // as well as the isolated app-server override, without copying its value.
+    // Preserve the current shared desktop declaration without copying values.
+    // The isolated app-server binding separately limits inheritance to the core.
     let mut inherited_names = toml_edit::Array::new();
-    inherited_names.push("CODEX_WINDOWS_REGISTERED_CORE");
+    for name in WINDOWS_NATIVE_INVENTORY_ENV_VARS {
+        inherited_names.push(name);
+    }
     server.insert("env_vars", toml_edit::value(inherited_names));
     let updated = config.to_string();
     Ok((updated != contents).then_some(updated))
@@ -2918,6 +2920,16 @@ pub(super) fn native_bridge_root_path(platform: &str, _codex_home: &Path) -> Opt
     }
 }
 
+// The shared desktop inventory includes browser access, while Satelle's isolated
+// native binding below inherits only the registered core. Setup must write the
+// same declaration that admission validates.
+const WINDOWS_NATIVE_INVENTORY_ENV_VARS: [&str; 4] = [
+    "BROWSER_USE_ACCESS_EXECUTOR_ID",
+    "BROWSER_USE_ACCESS_PIPE_PATH",
+    "BROWSER_USE_ACCESS_VERIFYING_IDENTITY",
+    "CODEX_WINDOWS_REGISTERED_CORE",
+];
+
 fn trusted_native_mcp_binding(
     server: &ConfiguredMcpServer,
     platform: &str,
@@ -2933,14 +2945,8 @@ fn trusted_native_mcp_binding(
         "windows" => {
             // The desktop shares this bridge with browser access. Validate its
             // declaration, then retain only native authority in the binding below.
-            let inventory_env_vars = [
-                "BROWSER_USE_ACCESS_EXECUTOR_ID",
-                "BROWSER_USE_ACCESS_PIPE_PATH",
-                "BROWSER_USE_ACCESS_VERIFYING_IDENTITY",
-                "CODEX_WINDOWS_REGISTERED_CORE",
-            ];
-            if server.transport.env_vars.len() != inventory_env_vars.len()
-                || !inventory_env_vars
+            if server.transport.env_vars.len() != WINDOWS_NATIVE_INVENTORY_ENV_VARS.len()
+                || !WINDOWS_NATIVE_INVENTORY_ENV_VARS
                     .iter()
                     .all(|name| server.transport.env_vars.iter().any(|value| value == name))
                 || !server.transport.args.is_empty()
