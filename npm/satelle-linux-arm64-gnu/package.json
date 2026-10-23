@@ -1,6 +1,6 @@
 {
   "name": "@microck/satelle-linux-arm64-gnu",
-  "version": "0.1.40",
+  "version": "0.1.41",
   "description": "Satelle native CLI for Linux ARM64 with glibc.",
   "license": "MIT",
   "repository": {

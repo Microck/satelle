@@ -1,3 +1,13 @@
+## satelle@0.1.41
+
+### Complete release publication
+
+The 0.1.40 npm and GitHub release did not finish publication. Use 0.1.41 for the complete release across installation channels.
+
+### Host recovery and diagnostics
+
+This release includes the macOS clean-exit service fix, current Windows native inventory support and explicit Doctor timeout handling from 0.1.40. The Windows inventory fix clears native trust rejection; native screenshot capture still requires live device verification.
+
 ## satelle@0.1.40
 
 ### macOS Host service
