@@ -560,6 +560,7 @@
 - satelle setup stores daemon path overrides in a Satelle-owned per-service configuration surface instead of the global operating-system environment @spec @mvp @implemented
 - satelle setup does not configure persistent Linux Host Daemon services in MVP because Linux is not a supported native Computer Use remote host platform @spec @mvp @implemented
 - satelle setup uses launchd plist EnvironmentVariables for persistent daemon path overrides on macOS hosts that use launchd @spec @mvp @implemented
+- macOS persistent Host lifecycle observations run in the authenticated user login shell without changing its command search path, and verify the owner-only canonical service definition before service mutations @spec @mvp @implemented
 - macOS persistent Host services start at login and restart after failure, but stay stopped after a successful exit so an intentional SSH state-owner handoff cannot race a respawned Host; the canonical launchd policy is RunAtLoad=true and KeepAlive.SuccessfulExit=false @spec @mvp @implemented
 - satelle setup uses Satelle-owned Windows service configuration for persistent daemon path overrides on Windows hosts instead of modifying global machine environment variables @spec @mvp @implemented
 - satelle setup plan output shows the current resolved Satelle Path Set and the planned resolved Satelle Path Set when persisting or changing daemon path overrides @spec @mvp @implemented

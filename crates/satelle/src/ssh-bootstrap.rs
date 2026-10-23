@@ -5081,7 +5081,7 @@ if (($file -isnot [IO.FileInfo]) -or $file.PSIsContainer -or $file.Length -eq 0 
         .map(|(parent, _)| parent)
         .ok_or(SshBootstrapError::InvalidPersistentServiceDefinition)?;
     Ok(format!(
-        "set -eu\npath={}\ndirectory={}\nuid=$(id -u)\n[ -d \"$directory\" ] && [ ! -L \"$directory\" ]\n[ -f \"$path\" ] && [ ! -L \"$path\" ]\n[ \"$(stat -f %u \"$directory\")\" = \"$uid\" ] && [ \"$(stat -f %Lp \"$directory\")\" = 700 ]\n[ \"$(stat -f %u \"$path\")\" = \"$uid\" ] && [ \"$(stat -f %Lp \"$path\")\" = 600 ]\nsize=$(stat -f %z \"$path\")\n[ \"$size\" -gt 0 ] && [ \"$size\" -le {} ]\ncat \"$path\"",
+        "set -eu\nservice_path={}\nservice_directory={}\nuid=$(id -u)\n[ -d \"$service_directory\" ] && [ ! -L \"$service_directory\" ]\n[ -f \"$service_path\" ] && [ ! -L \"$service_path\" ]\n[ \"$(stat -f %u \"$service_directory\")\" = \"$uid\" ] && [ \"$(stat -f %Lp \"$service_directory\")\" = 700 ]\n[ \"$(stat -f %u \"$service_path\")\" = \"$uid\" ] && [ \"$(stat -f %Lp \"$service_path\")\" = 600 ]\nsize=$(stat -f %z \"$service_path\")\n[ \"$size\" -gt 0 ] && [ \"$size\" -le {} ]\ncat \"$service_path\"",
         posix_quote(&plist_path),
         posix_quote(plist_directory),
         SERVICE_DEFINITION_LIMIT,
@@ -9214,6 +9214,44 @@ try {{
         assert!(macos.contains("= 700"));
         assert!(macos.contains("= 600"));
         assert!(macos.contains(&SERVICE_DEFINITION_LIMIT.to_string()));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn persistent_service_path_override_observation_works_in_zsh() {
+        let home = tempfile::tempdir().expect("temporary macOS SSH home");
+        let service_directory = home.path().join("Library/LaunchAgents");
+        fs::create_dir_all(&service_directory).unwrap();
+        fs::set_permissions(&service_directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let service_path = service_directory.join("dev.microck.satelle.host.plist");
+        let contents = b"private service definition";
+        fs::write(&service_path, contents).unwrap();
+        fs::set_permissions(&service_path, fs::Permissions::from_mode(0o600)).unwrap();
+        let mut directories = RemoteUserDirectories::for_tests(RemoteTarget::DarwinArm64);
+        directories.home = home.path().to_str().unwrap().to_string();
+        let command = service_path_overrides_observation_command(
+            RemoteTarget::DarwinArm64,
+            &directories,
+            "host-123",
+        )
+        .unwrap();
+        // SSH executes this command in the user's shell. In zsh, assigning
+        // `path` changes PATH, so the first external command stops resolving.
+        let observe = || {
+            Command::new("/bin/zsh")
+                .args(["-f", "-c", &command])
+                .output()
+                .unwrap()
+        };
+        let output = observe();
+        assert!(output.status.success(), "{:?}", output);
+        assert_eq!(output.stdout, contents);
+
+        // Retain the ownership boundary when running in the same real shell.
+        fs::set_permissions(&service_path, fs::Permissions::from_mode(0o644)).unwrap();
+        let rejected = observe();
+        assert!(!rejected.status.success());
+        assert!(rejected.stdout.is_empty());
     }
 
     #[test]
