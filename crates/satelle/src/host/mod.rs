@@ -5892,14 +5892,7 @@ fn production_doctor_with_provider_intent(
     // Phase 0 is an atomic capability observation. Keep it as one real probe,
     // and add hidden prerequisite scopes only when a selected probe consumes
     // their evidence.
-    let execution_scopes = DoctorScope::ALL
-        .into_iter()
-        .filter(|scope| {
-            scope_selection.contains(*scope)
-                || *scope == DoctorScope::Codex
-                || (provider_probe_required && *scope == DoctorScope::ComputerUse)
-        })
-        .collect::<Vec<_>>();
+    let execution_scopes = scope_selection.execution_scopes(provider_probe_required);
     let mut probes = production_doctor_probes(
         &execution_scopes,
         options.probe_timeout(),

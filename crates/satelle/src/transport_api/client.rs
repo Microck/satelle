@@ -407,7 +407,7 @@ impl DaemonClient {
         let (http_request, request_id) =
             self.mutation_request("/v1/local/doctor", idempotency_key)?;
         self.send_authenticated::<LocalDoctorOperationResponse>(
-            self.admission_request(http_request.json(&request)),
+            self.doctor_request(http_request.json(&request), scope_selection, options),
             request_id,
             StatusCode::OK,
         )
@@ -1017,6 +1017,32 @@ impl DaemonClient {
             Some(timeout) => request.timeout(timeout),
             None => request,
         }
+    }
+
+    fn doctor_request(
+        &self,
+        request: RequestBuilder,
+        scopes: &crate::core::doctor::DoctorScopeSelection,
+        options: crate::core::DoctorOptions,
+    ) -> RequestBuilder {
+        let Some(probe_timeout) = options.probe_timeout() else {
+            return self.admission_request(request);
+        };
+        let provider = scopes.contains(crate::core::doctor::DoctorScope::Provider);
+        // The Host resolves whether provider verification needs native input.
+        // Reserve that prerequisite and provider-auth when provider is selected.
+        // Each probe may wait one budget for admission and run for another;
+        // summing also covers --serial-probes. Cleanup is inside the probe's
+        // deadline. Only response delivery needs additional slack.
+        let per_probe = probe_timeout.saturating_mul(2);
+        let mut timeout = Duration::from_secs(5);
+        for _ in scopes.execution_scopes(provider) {
+            timeout = timeout.saturating_add(per_probe);
+        }
+        if provider {
+            timeout = timeout.saturating_add(per_probe);
+        }
+        request.timeout(timeout.max(self.admission_timeout.unwrap_or(Duration::ZERO)))
     }
 
     fn provider_validation_request(&self, request: RequestBuilder) -> RequestBuilder {
@@ -2380,6 +2406,99 @@ mod tests {
             .build()
             .expect("build provider validation request");
         assert_eq!(validation_request.timeout(), Some(&admission_timeout));
+    }
+
+    #[test]
+    fn doctor_timeout_covers_hidden_and_serial_probe_budgets() {
+        let client = DaemonClient::loopback_with_timeout(
+            "127.0.0.1:1".parse().unwrap(),
+            ApiBearerToken::generate().unwrap(),
+            "host-doctor-timeout",
+            Duration::from_secs(30),
+        )
+        .unwrap()
+        .with_admission_timeout(Duration::from_secs(245));
+        for (selected, expected_seconds) in
+            [("computer-use", 1205), ("provider", 2405), ("all", 3605)]
+        {
+            let scopes =
+                crate::core::doctor::DoctorScopeSelection::parse(&[selected.to_string()]).unwrap();
+            for serial in [false, true] {
+                let options = crate::core::DoctorOptions::new(true, Some(Duration::from_secs(300)))
+                    .unwrap()
+                    .with_serial_probes(serial);
+                let request = client
+                    .doctor_request(client.client.post("http://127.0.0.1:1"), &scopes, options)
+                    .build()
+                    .unwrap();
+                assert_eq!(
+                    request.timeout(),
+                    Some(&Duration::from_secs(expected_seconds))
+                );
+            }
+            let options = crate::core::DoctorOptions::new(true, None).unwrap();
+            let request = client
+                .doctor_request(client.client.post("http://127.0.0.1:1"), &scopes, options)
+                .build()
+                .unwrap();
+            assert_eq!(request.timeout(), Some(&Duration::from_secs(245)));
+        }
+    }
+
+    #[test]
+    fn doctor_explicit_timeout_preserves_the_remote_typed_result() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut bytes = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            while !bytes.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let read = stream.read(&mut chunk).unwrap();
+                assert_ne!(read, 0);
+                bytes.extend_from_slice(&chunk[..read]);
+            }
+            let headers = String::from_utf8(bytes).unwrap();
+            assert!(headers.starts_with("POST /v1/local/doctor HTTP/1.1\r\n"));
+            let request_id =
+                RequestId::parse(header_value(&headers, "satelle-request-id").unwrap()).unwrap();
+            // A real response arrives after both configured client deadlines,
+            // but within the explicit probe budget.
+            std::thread::sleep(Duration::from_millis(150));
+            let response = LocalDoctorOperationResponse::new(
+                request_id,
+                "host-doctor-timeout".to_string(),
+                Err(crate::core::SatelleError::state_conflict().into()),
+            );
+            let body = serde_json::to_string(&response).unwrap();
+            write!(stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len(),
+            ).unwrap();
+        });
+        let client = DaemonClient::loopback_with_timeout(
+            address,
+            ApiBearerToken::generate().unwrap(),
+            "host-doctor-timeout",
+            Duration::from_millis(50),
+        )
+        .unwrap()
+        .with_admission_timeout(Duration::from_millis(50));
+        let scopes =
+            crate::core::doctor::DoctorScopeSelection::parse(&["computer-use".to_string()])
+                .unwrap();
+        let response = client.local_doctor_operation(
+            "host-doctor-timeout",
+            &scopes,
+            crate::core::DoctorOptions::new(true, Some(Duration::from_millis(200))).unwrap(),
+            &crate::host::ProviderComputerUseIntent::new(None, None, true),
+            "doctor-timeout-test",
+        );
+        server.join().unwrap();
+        let failure = response
+            .expect("transport must preserve the Doctor response")
+            .unwrap_err();
+        assert_eq!(failure.error.code, crate::core::ErrorCode::StateConflict);
     }
 
     #[test]
