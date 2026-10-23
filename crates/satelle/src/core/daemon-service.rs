@@ -537,6 +537,8 @@ pub fn render_launchd_user_plist_with_policies(
         )
         .expect("writing to a String cannot fail");
     }
+    // A clean state-owner handoff must stay stopped until setup starts the replacement.
+    // Unconditional KeepAlive would let the old Host reclaim the store mid-handoff.
     Ok(format!(
         concat!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
@@ -557,7 +559,8 @@ pub fn render_launchd_user_plist_with_policies(
             "{}",
             "{}",
             "</array><key>EnvironmentVariables</key><dict>{}</dict>",
-            "<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>",
+            "<key>RunAtLoad</key><true/><key>KeepAlive</key>",
+            "<dict><key>SuccessfulExit</key><false/></dict>",
             "</dict></plist>"
         ),
         xml_escape(binary),
@@ -1577,6 +1580,10 @@ mod tests {
             storage_policy().with_platform_log_sink(true),
         )
         .expect("valid launchd definition");
+        assert!(plist.contains(concat!(
+            "<key>RunAtLoad</key><true/><key>KeepAlive</key>",
+            "<dict><key>SuccessfulExit</key><false/></dict>",
+        )));
         assert!(plist.contains("<key>EnvironmentVariables</key>"));
         assert!(plist.contains("<key>SATELLE_HOME</key>"));
         assert!(plist.contains("Satelle &amp; Host"));
