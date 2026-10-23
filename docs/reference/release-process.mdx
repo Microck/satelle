@@ -158,6 +158,13 @@ requires `contents: write` because GitHub only exposes draft releases to tokens
 with push access; it rechecks the draft before signing. The final npm verification
 job needs the same permission to download the draft package manifest.
 
+Each signing-service request has a 60-second deadline and no automatic retries.
+Rekor can commit a transparency-log entry before a response is lost; posting it
+again can produce a fatal duplicate-entry conflict in the npm signing client.
+An uncertain signing failure stays visible for inspection before an operator
+retries the signing job. Tarball integrity and provenance verification still gate
+publication.
+
 The signing job uploads the
 `npm-publication` Actions artifact containing all eight tarballs, their manifest,
 and one Sigstore bundle per tarball. CI does not reserve npm versions or publish

@@ -317,6 +317,7 @@
 - satelle local developer machines may build, test, package, and dry-run releases but do not publish npm packages, upload final public GitHub release assets, or mint public release provenance @spec @mvp @implemented
 - satelle public npm package publishing uses npm trusted publishing with OIDC instead of long-lived npm automation tokens when npm supports trusted publishing for the package @spec @mvp @implemented
 - satelle public npm package publishing runs on cloud-hosted CI runners capable of generating npm provenance attestations @spec @mvp @implemented
+- npm provenance signing gives each signing-service request a 60-second deadline and disables automatic request retries so a committed transparency-log write is not posted again after a lost response @spec @contract @release-gate @implemented
 - satelle public release workflow generates GitHub artifact attestations for each native binary artifact before publishing the release @spec @mvp @implemented
 - satelle public release workflow produces checksum and integrity metadata for every native binary artifact before publishing npm packages or GitHub release assets @spec @mvp @implemented
 - satelle public GitHub release workflow creates or updates a draft release, attaches all release assets and metadata, and verifies the release artifact set @spec @mvp @implemented

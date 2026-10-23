@@ -2699,7 +2699,10 @@ test("release workflow signs npm artifacts for local publication before final ve
   assert.match(prepareNpm, /^    permissions:\n      contents: write\n      id-token: write$/m);
   assert.match(prepareNpm, /npm install --global npm@11\.15\.0/);
   assert.match(signStep, /recheck_release_tag[\s\S]*validate-npm-artifacts validated\/npm/);
-  assert.match(signStep, /createHash\('sha512'\)[\s\S]*npa.toPurl[\s\S]*generateProvenance\(\[subject\], \{\}\)/);
+  assert.match(
+    signStep,
+    /createHash\('sha512'\)[\s\S]*npa.toPurl[\s\S]*generateProvenance\(\[subject\], \{\s*timeout: 60_000,\s*retry: \{ retries: 0 \},\s*\}\)/,
+  );
   assert.match(signStep, /writeFileSync\(`\$\{artifact\}\.sigstore`/);
   assert.match(prepareNpm, /name: npm-publication[\s\S]*path: validated\/npm\/\*/);
   assert.doesNotMatch(prepareNpm, /npm (?:stage )?publish/);

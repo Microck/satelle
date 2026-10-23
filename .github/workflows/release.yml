@@ -880,7 +880,12 @@ jobs:
               const artifact = path.join('validated/npm', entry.file);
               const digest = createHash('sha512').update(fs.readFileSync(artifact)).digest('hex');
               const subject = { name: npa.toPurl(npa.resolve(entry.package, entry.version)), digest: { sha512: digest } };
-              const bundle = await generateProvenance([subject], {});
+              // Rekor may commit before a response is lost. Wait for one request
+              // instead of automatically posting an uncertain write again.
+              const bundle = await generateProvenance([subject], {
+                timeout: 60_000,
+                retry: { retries: 0 },
+              });
               fs.writeFileSync(`${artifact}.sigstore`, JSON.stringify(bundle));
             }
           })().catch(error => { console.error(error); process.exitCode = 1; });
