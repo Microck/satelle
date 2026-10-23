@@ -801,6 +801,7 @@
 - satelle doctor provider refresh timeout option is --timeout <duration> and uses the same explicit-unit duration syntax as configuration @implemented @mvp
 - satelle doctor accepts --timeout only with --refresh and a selected computer-use, provider, or all scope and otherwise reports a typed refresh-timeout-without-refresh usage error @spec @mvp @implemented
 - when doctor refresh selects both computer-use and provider, one --timeout value applies independently to each live probe rather than to their combined wall-clock duration @spec @mvp @implemented
+- remote doctor requests with an explicit timeout allow the selected probes and hidden prerequisites to finish their admission and execution budgets, including serial execution, before the HTTP deadline; a live Host must not become host-unreachable because the transport retained the shorter configured admission timeout @contract @mvp @implemented
 - satelle doctor implementation uses modular probes internally instead of encoding subsystem checks directly in the command handler @implemented @mvp
 - satelle diagnostic bundle export ships after MVP logs, status, and doctor behavior @spec @implemented
 - satelle diagnostic bundle export is a support workflow layered on implemented logs, status, and doctor diagnostics instead of a prerequisite for them @spec @implemented

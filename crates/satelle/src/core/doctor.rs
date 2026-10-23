@@ -139,6 +139,20 @@ impl DoctorScopeSelection {
         self.scopes.contains(&scope)
     }
 
+    /// Include the atomic capability observation and any native prerequisite
+    /// consumed by provider verification. Transport budgeting uses this same
+    /// scope set so hidden work cannot outlive its request.
+    pub fn execution_scopes(&self, provider_requires_native: bool) -> Vec<DoctorScope> {
+        DoctorScope::ALL
+            .into_iter()
+            .filter(|scope| {
+                self.contains(*scope)
+                    || *scope == DoctorScope::Codex
+                    || (provider_requires_native && *scope == DoctorScope::ComputerUse)
+            })
+            .collect()
+    }
+
     pub fn supports_refresh(&self) -> bool {
         self.scopes.iter().any(|scope| scope.supports_refresh())
     }
