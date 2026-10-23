@@ -1,6 +1,6 @@
 core:changelogs:
-  - content: "---\npackages:\n  cargo:satelle:\n    type: patch\n---\n\n## macOS Host service\n\nKeep Satelle stopped after an intentional clean exit so setup can replace the Host without launchd starting the old process again. Restart after unexpected failure.\n\n## Windows Computer Use\n\nAccept the current official Codex desktop runtime declaration while preserving native-only execution and protected helper verification. This fixes the native inventory trust rejection; it does not resolve native screenshot capture failures.\n\n## Diagnostic timeouts\n\nHonor an explicit Doctor timeout across selected probes and their prerequisites. A longer refresh no longer reports an otherwise reachable Host as unreachable because the HTTP deadline expired first.\n"
-    filename: host-recovery-and-native-inventory.md
+  - content: "---\npackages:\n  cargo:satelle:\n    type: patch\n---\n\n## Complete release publication\n\nThe 0.1.40 npm and GitHub release did not finish publication. Use 0.1.41 for the complete release across installation channels.\n\n## Host recovery and diagnostics\n\nThis release includes the macOS clean-exit service fix, current Windows native inventory support and explicit Doctor timeout handling from 0.1.40. The Windows inventory fix clears native trust rejection; native screenshot capture still requires live device verification.\n"
+    filename: release-publication-recovery.md
     v: 0.0.0
 core:packages:
   - id: npm:satelle-repository
@@ -8,7 +8,7 @@ core:packages:
   - id: npm:satelle-docs
     updated: false
   - changelogIds:
-      - host-recovery-and-native-inventory.md
+      - release-publication-recovery.md
     id: cargo:satelle
     updated: true
 npm:packages:
