@@ -3179,7 +3179,7 @@ fn apply_remote_managed_setup(
                 "direct Host transport operation failed"
             );
             let api_code = api_error.code();
-            if managed_setup_rejection_precedes_mutation(&error) {
+            if bootstrap_maintenance_rejection_precedes_mutation(&error) {
                 commit_verified_bootstrap_mutation(alias, bootstrap_lock)?;
             }
             if api_code == ApiErrorCode::ComputerUseNotReady {
@@ -9767,16 +9767,6 @@ fn managed_setup_failure_is_reconciled(error: &SatelleError) -> bool {
             .get("changed")
             .and_then(serde_json::Value::as_bool)
             == Some(false)
-}
-
-fn managed_setup_rejection_precedes_mutation(error: &DaemonClientError) -> bool {
-    bootstrap_maintenance_rejection_precedes_mutation(error)
-        || matches!(
-            error,
-            DaemonClientError::Api { error, .. }
-                if error.code() == ApiErrorCode::ComputerUseNotReady
-                    && is_closed_macos_manual_computer_use_error(error)
-        )
 }
 
 fn map_desktop_selection_api_error(host: &str, error: &ApiError) -> SatelleError {

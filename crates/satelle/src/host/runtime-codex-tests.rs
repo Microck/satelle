@@ -2198,7 +2198,12 @@ fn macos_setup_maps_only_missing_official_components_to_manual_action() {
         let mut source = SatelleError::computer_use_not_ready();
         source.details.insert("reason".to_string(), json!(reason));
         let mapped = macos_setup_prerequisite_error(source);
-        assert_eq!(mapped.code, ErrorCode::ComputerUseNotReady);
+        assert_eq!(mapped.code, ErrorCode::SetupActionFailed);
+        assert_eq!(mapped.details["changed"], false);
+        assert_eq!(
+            mapped.details["failed_action"],
+            "validate-macos-computer-use"
+        );
         assert_eq!(mapped.details["status"], "manual_action_required");
         assert_eq!(
             mapped.details["reason"],
@@ -2211,6 +2216,12 @@ fn macos_setup_maps_only_missing_official_components_to_manual_action() {
         .details
         .insert("reason".to_string(), json!("native_bridge_untrusted"));
     let untrusted = macos_setup_prerequisite_error(source);
+    assert_eq!(untrusted.code, ErrorCode::SetupActionFailed);
+    assert_eq!(untrusted.details["changed"], false);
+    assert_eq!(
+        untrusted.details["failed_action"],
+        "validate-macos-computer-use"
+    );
     assert_eq!(untrusted.details["reason"], "native_bridge_untrusted");
     assert!(!untrusted.details.contains_key("status"));
 }

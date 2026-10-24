@@ -845,24 +845,38 @@ pub(super) fn macos_setup_prerequisite_error(error: SatelleError) -> SatelleErro
                     | "native_bridge_missing"
             )
         });
-    if !missing {
-        return error;
-    }
-
-    SatelleError {
-        code: crate::core::ErrorCode::ComputerUseNotReady,
-        message: "macOS Computer Use requires the current signed ChatGPT desktop components"
-            .to_string(),
-        recovery_command: Some("satelle doctor --scope computer-use --refresh --json".to_string()),
-        source_detail: None,
-        details: BTreeMap::from([
-            (
-                "reason".to_string(),
-                json!("macos_native_computer_use_prerequisite_missing"),
+    let mut diagnostic = if missing {
+        SatelleError {
+            code: crate::core::ErrorCode::ComputerUseNotReady,
+            message: "macOS Computer Use requires the current signed ChatGPT desktop components"
+                .to_string(),
+            recovery_command: Some(
+                "satelle doctor --scope computer-use --refresh --json".to_string(),
             ),
-            ("status".to_string(), json!("manual_action_required")),
-        ]),
-    }
+            source_detail: None,
+            details: BTreeMap::from([
+                (
+                    "reason".to_string(),
+                    json!("macos_native_computer_use_prerequisite_missing"),
+                ),
+                ("status".to_string(), json!("manual_action_required")),
+            ]),
+        }
+    } else {
+        error
+    };
+    // This producer only validates signed prerequisites. Report its no-change
+    // outcome through the existing managed-setup failure contract, so the
+    // Controller can finish maintenance instead of retaining an unknown fence.
+    diagnostic.code = crate::core::ErrorCode::SetupActionFailed;
+    diagnostic.details.insert(
+        "failed_action".to_string(),
+        json!("validate-macos-computer-use"),
+    );
+    diagnostic
+        .details
+        .insert("changed".to_string(), json!(false));
+    diagnostic
 }
 
 #[cfg(any(windows, test))]
