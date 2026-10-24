@@ -37,6 +37,14 @@ satelle doctor --host <alias> --scope computer-use --refresh --timeout 120s --js
 The timeout requires an explicit unit such as `30s` or `2m`. Refresh does not
 perform setup, repair, service installation, or configuration changes.
 
+macOS native setup validates the installed signed desktop components without
+changing them. A failed validation reports `setup-action-failed` with
+`failed_action: validate-macos-computer-use` and `changed: false`. This explicit
+action outcome lets setup record the failure and release its mutation fence.
+It does not weaken native admission or permit an uncertain mutation to be
+treated as unchanged. Use Doctor to inspect the native readiness cause.
+Readiness errors alone do not release a managed setup fence.
+
 ## Read normalized logs
 
 ```sh

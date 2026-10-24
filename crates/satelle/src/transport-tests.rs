@@ -7232,14 +7232,14 @@ fn manual_macos_setup_details_round_trip_only_in_the_closed_shape() {
     });
 
     let exact_manual_error = api_error("computer-use-not-ready", details.clone());
-    assert!(managed_setup_rejection_precedes_mutation(
+    assert!(!bootstrap_maintenance_rejection_precedes_mutation(
         &DaemonClientError::Api {
             status: reqwest::StatusCode::CONFLICT,
             error: Box::new(exact_manual_error.clone()),
         }
     ));
     let generic_internal_error = api_error("internal-error", serde_json::json!({}));
-    assert!(!managed_setup_rejection_precedes_mutation(
+    assert!(!bootstrap_maintenance_rejection_precedes_mutation(
         &DaemonClientError::Api {
             status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
             error: Box::new(generic_internal_error),
@@ -7335,6 +7335,16 @@ fn managed_setup_failure_reconciles_only_a_validated_no_change_result() {
     assert_eq!(mapped.code, ErrorCode::SetupActionFailed);
     assert_eq!(mapped.details["failed_action"], "prepare-package-root");
     assert!(managed_setup_failure_is_reconciled(&mapped));
+    let native_validation = map_managed_setup_api_error(
+        "tailnet-host",
+        satelle::core::SetupMode::Persistent,
+        "computer-use",
+        &api_error(serde_json::json!({
+            "failed_action": "validate-macos-computer-use", "changed": false
+        })),
+    );
+    assert_eq!(native_validation.code, ErrorCode::SetupActionFailed);
+    assert!(managed_setup_failure_is_reconciled(&native_validation));
     let partial = map_managed_setup_api_error(
         "tailnet-host",
         satelle::core::SetupMode::Persistent,
@@ -7350,7 +7360,7 @@ fn managed_setup_failure_reconciles_only_a_validated_no_change_result() {
         )
     );
     assert!(!mapped.message.contains("PRIVATE"));
-    assert!(!managed_setup_rejection_precedes_mutation(
+    assert!(!bootstrap_maintenance_rejection_precedes_mutation(
         &DaemonClientError::Api {
             status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
             error: Box::new(error),

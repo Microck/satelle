@@ -913,6 +913,19 @@ mod tests {
             Some(json!({"failed_action": "prepare-package-root", "changed": false}))
         );
         assert!(!mapped.message.contains("PRIVATE"));
+        error.details.insert(
+            "failed_action".to_string(),
+            json!("validate-macos-computer-use"),
+        );
+        error
+            .details
+            .insert("reason".to_string(), json!("native_bridge_untrusted"));
+        assert_eq!(
+            failure(&error).details,
+            Some(json!({
+                "failed_action": "validate-macos-computer-use", "changed": false
+            }))
+        );
         error
             .details
             .insert("failed_action".to_string(), json!("extract-codex-package"));
