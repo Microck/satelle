@@ -69,7 +69,6 @@ use crate::host::{
 };
 use recovery::RecoveryQueue;
 pub(crate) use recovery::VerifiedSetupPostconditions;
-#[cfg(test)]
 pub(crate) use recovery::verify_setup_postconditions;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
