@@ -1,6 +1,6 @@
 use super::{
-    SetupActionSkipReason, SetupActionStatus, SetupOperationKind, SetupRunStatus, Storage,
-    StorageError, StorageErrorKind, open,
+    MaintenanceLeaseState, SetupActionSkipReason, SetupActionStatus, SetupOperationKind,
+    SetupRunRecord, SetupRunStatus, Storage, StorageError, StorageErrorKind, open,
 };
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 /// Evidence for one exact abandoned or completed setup claim, never a lock reset.
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct BootstrapRecovery {
     pub schema_version: &'static str,
     pub host_identity: String,
@@ -28,6 +28,33 @@ pub(crate) fn recover(
     operation_id: &str,
     apply: bool,
 ) -> Result<BootstrapRecovery, StorageError> {
+    #[cfg(target_os = "macos")]
+    let mut native_prerequisites = MacNativePrerequisites(state_root);
+    #[cfg(target_os = "macos")]
+    let observer =
+        Some(&mut native_prerequisites as &mut dyn crate::host::SetupPostconditionObserver);
+    #[cfg(not(target_os = "macos"))]
+    let observer = None;
+    recover_with_observer(
+        state_root,
+        bootstrap_state_root,
+        expected_host_identity,
+        operation_id,
+        apply,
+        observer,
+    )
+}
+
+// The observer is available only on macOS in production. Tests exercise the
+// ledger/archive protocol with a fixture observer, without a signed SDK install.
+fn recover_with_observer(
+    state_root: &Path,
+    bootstrap_state_root: &Path,
+    expected_host_identity: &str,
+    operation_id: &str,
+    apply: bool,
+    observer: Option<&mut dyn crate::host::SetupPostconditionObserver>,
+) -> Result<BootstrapRecovery, StorageError> {
     // Never initialize a new database and mistake it for the original ledger.
     if !Storage::has_existing_state(state_root)? {
         return Err(conflict());
@@ -36,28 +63,33 @@ pub(crate) fn recover(
     // recovery cannot mutate the ledger while absence is checked and archived.
     // Retention preserves running and outcome-unknown runs. Absence establishes
     // no remaining recovery work, not that a historical transaction never ran.
-    let storage = Storage::open_without_restart_recovery(state_root)?;
+    let mut storage = Storage::open_without_restart_recovery(state_root)?;
     if storage.host_identity()?.as_str() != expected_host_identity {
         return Err(conflict());
     }
     let run = storage.load_setup_run(operation_id)?;
+    let native_validation = observer.is_some() && run.as_ref().is_some_and(native_validation_run);
     let completed = if let Some(run) = run.as_ref() {
         if !matches!(
             run.operation_kind(),
             SetupOperationKind::Setup | SetupOperationKind::Repair
-        ) || run.status() != SetupRunStatus::Completed
-            || run.actions().is_empty()
-            || run.actions().iter().any(|action| match action.status() {
-                SetupActionStatus::Completed => false,
-                SetupActionStatus::Skipped => !matches!(
-                    action.skip_reason(),
-                    Some(
-                        SetupActionSkipReason::AlreadySatisfied
-                            | SetupActionSkipReason::NotRequired
-                    )
-                ),
-                _ => true,
-            })
+        ) {
+            return Err(conflict());
+        }
+        if !native_validation
+            && (run.status() != SetupRunStatus::Completed
+                || run.actions().is_empty()
+                || run.actions().iter().any(|action| match action.status() {
+                    SetupActionStatus::Completed => false,
+                    SetupActionStatus::Skipped => !matches!(
+                        action.skip_reason(),
+                        Some(
+                            SetupActionSkipReason::AlreadySatisfied
+                                | SetupActionSkipReason::NotRequired
+                        )
+                    ),
+                    _ => true,
+                }))
         {
             return Err(conflict());
         }
@@ -68,10 +100,10 @@ pub(crate) fn recover(
             [],
             |row| row.get(0),
         ).map_err(|error| StorageError::with_source(StorageErrorKind::OperationFailed, error))?;
-        if leased {
+        if leased && !native_validation {
             return Err(conflict());
         }
-        true
+        !native_validation
     } else {
         false
     };
@@ -108,17 +140,21 @@ pub(crate) fn recover(
             "initial_setup" | "missing_daemon_repair"
         )
         || value("state")? != "recovery_pending"
-        || !matches!(
-            (completed, value("mutation_phase")?),
-            (false, "setup_maintenance_begin")
-                | (
-                    true,
-                    "setup_maintenance_begin"
-                        | "setup_action_start"
-                        | "setup_action_complete"
-                        | "setup_maintenance_finish"
-                )
-        )
+        || !(if native_validation {
+            value("mutation_phase")? == "managed_setup"
+        } else {
+            matches!(
+                (completed, value("mutation_phase")?),
+                (false, "setup_maintenance_begin")
+                    | (
+                        true,
+                        "setup_maintenance_begin"
+                            | "setup_action_start"
+                            | "setup_action_complete"
+                            | "setup_maintenance_finish"
+                    )
+            )
+        })
         || !hex_identity(identity)
         || !hex_identity(attempt)
         || claim_nonce.is_none_or(|nonce| {
@@ -151,12 +187,65 @@ pub(crate) fn recover(
         mutation_attempt: attempt.to_string(),
         outcome: if completed {
             "setup_run_completed"
+        } else if native_validation {
+            "macos_native_prerequisites_reconciled"
         } else {
             "begin_has_no_ledger_run"
         },
         archive_path: bootstrap_state_root
             .join(format!("bootstrap-recovered.{operation_id}.{identity}")),
         changed: apply,
+    };
+    let mut receipt_report = report.clone();
+    receipt_report.changed = true;
+    let receipt = serde_json::to_vec(&receipt_report)
+        .map_err(|error| StorageError::with_source(StorageErrorKind::OperationFailed, error))?;
+    let existing_receipt = claim.read_private_leaf_bounded("recovery.json", 4096)?;
+    if existing_receipt
+        .as_ref()
+        .is_some_and(|existing| *existing != receipt)
+    {
+        return Err(conflict());
+    }
+    let reconciliation = if native_validation {
+        let control_lease: bool = storage
+            .connection
+            .query_row("SELECT EXISTS(SELECT 1 FROM control_leases)", [], |row| {
+                row.get(0)
+            })
+            .map_err(|error| StorageError::with_source(StorageErrorKind::OperationFailed, error))?;
+        if control_lease {
+            return Err(conflict());
+        }
+        match storage.maintenance_lease_state()? {
+            Some(MaintenanceLeaseState::RecoveryPending(subject))
+                if subject.operation_id() == operation_id && !subject.has_postcheck() =>
+            {
+                let verified = crate::host::runtime::verify_setup_postconditions(
+                    &subject,
+                    observer.ok_or_else(conflict)?,
+                )
+                .map_err(|error| {
+                    StorageError::with_source(StorageErrorKind::OperationFailed, error)
+                })?;
+                if verified.outcome("native-computer-use") != Some(true) {
+                    return Err(conflict());
+                }
+                Some((subject, verified))
+            }
+            // A prior attempt may have committed the ledger, then crashed before
+            // archiving. Only its exact durable receipt permits that retry.
+            None if run
+                .as_ref()
+                .is_some_and(|run| run.status() == SetupRunStatus::PartialFailure)
+                && existing_receipt.is_some() =>
+            {
+                None
+            }
+            _ => return Err(conflict()),
+        }
+    } else {
+        None
     };
     if !apply {
         return Ok(report);
@@ -166,14 +255,25 @@ pub(crate) fn recover(
     {
         return Err(conflict());
     }
-    let receipt = serde_json::to_vec(&report)
-        .map_err(|error| StorageError::with_source(StorageErrorKind::OperationFailed, error))?;
-    // Persist the proof before freeing the fence. A crash leaves either the
-    // original claim plus receipt or the complete archive, never lost evidence.
-    match claim.read_private_leaf_bounded("recovery.json", 4096)? {
-        Some(existing) if existing == receipt => {}
-        Some(_) => return Err(conflict()),
-        None => claim.create_private_leaf_durable("recovery.json", &receipt)?,
+    // Stage outside the claim so an interrupted write is never mistaken for a
+    // final receipt. Both parents remain pinned, and publication cannot replace
+    // evidence. A crash may leave a private staging file for inspection.
+    if existing_receipt.is_none() {
+        let pending = format!(
+            "bootstrap-recovery-receipt.{operation_id}.{identity}.{}.pending",
+            uuid::Uuid::now_v7()
+        );
+        bootstrap_root.create_private_leaf_durable(&pending, &receipt)?;
+        bootstrap_root.move_child_durable(&pending, &claim, "recovery.json")?;
+    }
+    if let Some((subject, verified)) = reconciliation
+        && storage.reconcile_maintenance_after_restart(&subject, &verified)?
+            != Some(SetupRunStatus::PartialFailure)
+    {
+        return Err(conflict());
+    }
+    if read_claim(&claim_path, &claim)? != snapshot {
+        return Err(conflict());
     }
     drop(claim);
     lock_directory.move_child_durable(
@@ -190,6 +290,65 @@ pub(crate) fn recover(
     )?;
     // `storage` and both pinned parent directories remain alive through rename.
     Ok(report)
+}
+
+// Before recovery only the read-only native validation may be uncertain. After
+// reconciliation its dependents must all carry the transaction's failure skip.
+fn native_validation_run(run: &SetupRunRecord) -> bool {
+    let Some(index) = run
+        .actions()
+        .iter()
+        .position(|a| a.action_id() == "native-computer-use")
+    else {
+        return false;
+    };
+    let native_status = match run.status() {
+        SetupRunStatus::OutcomeUnknown => SetupActionStatus::OutcomeUnknown,
+        SetupRunStatus::PartialFailure => SetupActionStatus::Completed,
+        _ => return false,
+    };
+    index + 1 < run.actions().len()
+        && run.actions()[index].status() == native_status
+        && run.actions()[..index].iter().all(|a| {
+            a.status() == SetupActionStatus::Completed
+                || (a.status() == SetupActionStatus::Skipped
+                    && matches!(
+                        a.skip_reason(),
+                        Some(
+                            SetupActionSkipReason::AlreadySatisfied
+                                | SetupActionSkipReason::NotRequired
+                        )
+                    ))
+        })
+        && run.actions()[index + 1..]
+            .iter()
+            .all(|a| match run.status() {
+                SetupRunStatus::OutcomeUnknown => a.status() == SetupActionStatus::Planned,
+                _ => {
+                    a.status() == SetupActionStatus::Skipped
+                        && a.skip_reason() == Some(SetupActionSkipReason::DependencyFailed)
+                }
+            })
+}
+
+#[cfg(target_os = "macos")]
+struct MacNativePrerequisites<'a>(&'a Path);
+
+#[cfg(target_os = "macos")]
+impl crate::host::SetupPostconditionObserver for MacNativePrerequisites<'_> {
+    fn observe(
+        &mut self,
+        action: &super::SetupActionRecord,
+    ) -> Result<bool, crate::core::SatelleError> {
+        if action.action_id() != "native-computer-use" {
+            return Err(crate::core::SatelleError::state_conflict());
+        }
+        let runtime = crate::host::codex_install::admit_managed_codex_from_state_root(self.0)?;
+        // On macOS this is signed prerequisite validation only. Do not extend
+        // this recovery to platforms whose provisioning mutates installed files.
+        crate::host::codex_capabilities::provision_native_computer_use(&runtime)?;
+        Ok(true)
+    }
 }
 
 fn read_claim(
@@ -367,6 +526,228 @@ mod tests {
                 apply,
             )
         }
+
+        fn interrupt_native_setup(&self) {
+            let directory = open::open_state_root_read_only(&self.claim).unwrap();
+            directory
+                .delete_private_leaf_durable("mutation_phase")
+                .unwrap();
+            directory
+                .create_private_leaf_durable("mutation_phase", b"managed_setup")
+                .unwrap();
+            let mut storage = Storage::open_without_restart_recovery(&self.state).unwrap();
+            let now = OffsetDateTime::now_utc();
+            let plan = SetupRunPlan::new(
+                OPERATION,
+                SetupOperationKind::Setup,
+                None,
+                now,
+                [
+                    "bootstrap-handoff",
+                    "managed-codex",
+                    "native-computer-use",
+                    "path-set-directories",
+                    "service-config",
+                    "service-registration",
+                    "service-start-or-restart",
+                ]
+                .into_iter()
+                .map(|id| SetupActionPlan::new(id, id, true).unwrap())
+                .collect(),
+            )
+            .unwrap();
+            let owner = LeaseOwner::new(OPERATION, 123, "process", "boot", now).unwrap();
+            let capability = storage.begin_bootstrap_maintenance(&plan, owner).unwrap();
+            storage
+                .start_setup_action(&capability, "bootstrap-handoff", now)
+                .unwrap();
+            storage
+                .complete_setup_action_after_verified_postcondition(
+                    &capability,
+                    "bootstrap-handoff",
+                    now,
+                )
+                .unwrap();
+            storage
+                .start_setup_action(&capability, "managed-codex", now)
+                .unwrap();
+            storage
+                .complete_setup_action_after_verified_postcondition(
+                    &capability,
+                    "managed-codex",
+                    now,
+                )
+                .unwrap();
+            storage
+                .start_setup_action(&capability, "native-computer-use", now)
+                .unwrap();
+            storage
+                .retain_lease_recovery(capability.lease_owner())
+                .unwrap();
+        }
+
+        fn recover_native(
+            &self,
+            apply: bool,
+            verified: Option<bool>,
+        ) -> Result<BootstrapRecovery, StorageError> {
+            recover_with_observer(
+                &self.state,
+                &self.bootstrap,
+                &self.host_identity,
+                OPERATION,
+                apply,
+                Some(&mut PrerequisiteFixture(verified)),
+            )
+        }
+    }
+
+    // Only the signature validator is replaced by a fixture. The store,
+    // transaction, private files, receipt and archive operations are real.
+    struct PrerequisiteFixture(Option<bool>);
+
+    impl crate::host::SetupPostconditionObserver for PrerequisiteFixture {
+        fn observe(
+            &mut self,
+            _: &super::super::SetupActionRecord,
+        ) -> Result<bool, crate::core::SatelleError> {
+            self.0
+                .ok_or_else(crate::core::SatelleError::computer_use_not_ready)
+        }
+    }
+
+    #[test]
+    fn native_validation_recovery_preserves_partial_setup_history() {
+        let fixture = Fixture::new();
+        fixture.interrupt_native_setup();
+        let preview = fixture.recover_native(false, Some(true)).unwrap();
+        assert!(!preview.changed);
+        assert!(fixture.claim.is_dir());
+        {
+            let storage = Storage::open_without_restart_recovery(&fixture.state).unwrap();
+            assert_eq!(
+                storage.load_setup_run(OPERATION).unwrap().unwrap().status(),
+                SetupRunStatus::OutcomeUnknown
+            );
+            assert!(storage.maintenance_lease_state().unwrap().is_some());
+        }
+        let applied = fixture.recover_native(true, Some(true)).unwrap();
+        assert_eq!(applied.outcome, "macos_native_prerequisites_reconciled");
+        assert!(applied.archive_path.join("recovery.json").is_file());
+        assert!(!fixture.claim.exists());
+        let storage = Storage::open_without_restart_recovery(&fixture.state).unwrap();
+        let run = storage.load_setup_run(OPERATION).unwrap().unwrap();
+        assert_eq!(run.status(), SetupRunStatus::PartialFailure);
+        assert_eq!(run.actions()[2].status(), SetupActionStatus::Completed);
+        assert_eq!(
+            run.actions()[3].skip_reason(),
+            Some(SetupActionSkipReason::DependencyFailed)
+        );
+        assert!(storage.maintenance_lease_state().unwrap().is_none());
+    }
+
+    #[test]
+    fn failed_or_unknown_native_validation_preserves_the_fence_and_lease() {
+        for verified in [None, Some(false)] {
+            let fixture = Fixture::new();
+            fixture.interrupt_native_setup();
+            assert!(fixture.recover_native(true, verified).is_err());
+            assert!(fixture.claim.is_dir());
+            assert!(!fixture.claim.join("recovery.json").exists());
+            let storage = Storage::open_without_restart_recovery(&fixture.state).unwrap();
+            assert_eq!(
+                storage.load_setup_run(OPERATION).unwrap().unwrap().status(),
+                SetupRunStatus::OutcomeUnknown
+            );
+            assert!(storage.maintenance_lease_state().unwrap().is_some());
+        }
+    }
+
+    #[test]
+    fn native_recovery_receipt_resumes_only_after_its_exact_reconciliation() {
+        for with_receipt in [false, true] {
+            let fixture = Fixture::new();
+            fixture.interrupt_native_setup();
+            let mut report = fixture.recover_native(false, Some(true)).unwrap();
+            report.changed = true;
+            if with_receipt {
+                open::open_state_root_read_only(&fixture.claim)
+                    .unwrap()
+                    .create_private_leaf_durable(
+                        "recovery.json",
+                        &serde_json::to_vec(&report).unwrap(),
+                    )
+                    .unwrap();
+            }
+            // Model a crash after the real ledger transaction, before archive.
+            {
+                let mut storage = Storage::open_without_restart_recovery(&fixture.state).unwrap();
+                let Some(MaintenanceLeaseState::RecoveryPending(subject)) =
+                    storage.maintenance_lease_state().unwrap()
+                else {
+                    panic!("pending native setup")
+                };
+                let verified = crate::host::runtime::verify_setup_postconditions(
+                    &subject,
+                    &mut PrerequisiteFixture(Some(true)),
+                )
+                .unwrap();
+                storage
+                    .reconcile_maintenance_after_restart(&subject, &verified)
+                    .unwrap();
+            }
+            let result = fixture.recover_native(true, Some(true));
+            assert_eq!(result.is_ok(), with_receipt);
+            assert_eq!(fixture.claim.exists(), !with_receipt);
+        }
+    }
+
+    #[test]
+    fn interrupted_receipt_staging_does_not_poison_native_recovery() {
+        let fixture = Fixture::new();
+        fixture.interrupt_native_setup();
+        let pending = format!("bootstrap-recovery-receipt.{OPERATION}.{IDENTITY}.crashed.pending");
+        open::open_state_root_read_only(&fixture.bootstrap)
+            .unwrap()
+            .create_private_leaf_durable(&pending, b"{\"schema_version\":")
+            .unwrap();
+        let recovered = fixture.recover_native(true, Some(true)).unwrap();
+        assert!(fixture.bootstrap.join(pending).is_file());
+        assert_eq!(
+            fs::read(recovered.archive_path.join("recovery.json")).unwrap(),
+            serde_json::to_vec(&recovered).unwrap()
+        );
+    }
+
+    #[test]
+    fn native_recovery_transaction_failure_keeps_unknown_state_retryable() {
+        let fixture = Fixture::new();
+        fixture.interrupt_native_setup();
+        {
+            let storage = Storage::open_without_restart_recovery(&fixture.state).unwrap();
+            storage.connection.execute_batch("CREATE TRIGGER fail_native_recovery BEFORE DELETE ON maintenance_leases BEGIN SELECT RAISE(ABORT, 'fixture failure'); END;").unwrap();
+        }
+        assert!(fixture.recover_native(true, Some(true)).is_err());
+        assert!(fixture.claim.join("recovery.json").is_file());
+        {
+            let storage = Storage::open_without_restart_recovery(&fixture.state).unwrap();
+            assert_eq!(
+                storage.load_setup_run(OPERATION).unwrap().unwrap().status(),
+                SetupRunStatus::OutcomeUnknown
+            );
+            assert!(storage.maintenance_lease_state().unwrap().is_some());
+            storage
+                .connection
+                .execute_batch("DROP TRIGGER fail_native_recovery")
+                .unwrap();
+        }
+        assert!(
+            fixture
+                .recover_native(true, Some(true))
+                .unwrap()
+                .archive_path
+                .is_dir()
+        );
     }
 
     #[test]

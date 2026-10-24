@@ -71,6 +71,17 @@ satisfied or not required. A live store owner, uncertain action, remaining
 lease, foreign claim, or non-ledger mutation phase prevents recovery. An
 interrupted begin with no remaining ledger run can use the same command.
 
+On macOS, this command can also reconcile an interrupted `managed_setup`
+claim when `native-computer-use` is the only uncertain action. Recovery must
+successfully revalidate the installed managed runtime and signed desktop
+components. It then completes that validation action, skips its unexecuted
+dependents, records the old run as a partial failure, and releases its exact
+maintenance lease. It does not install components, grant permissions, or mark
+the unfinished setup as successful. Retry normal setup after recovery.
+Validation failure or any Control Lease leaves the claim fenced. A durable
+receipt permits retry if recovery stops after ledger reconciliation but before
+the claim is archived.
+
 ## Reset an offline Host store
 
 After stopping the Host, an explicitly approved `satelle host store reset`
