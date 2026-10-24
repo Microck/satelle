@@ -1,6 +1,6 @@
 core:changelogs:
-  - content: "---\npackages:\n  cargo:satelle:\n    type: patch\n---\n\n## macOS Host lifecycle\n\nStop and restart the persistent Host from the default macOS shell without reporting an otherwise reachable Host as unreachable.\n\n## Current macOS Computer Use runtime\n\nAccept the current official desktop bridge declaration while keeping native sessions isolated from browser access. Signed executable, service and runtime checks remain enforced. Native app access and macOS privacy permissions still require their own grants.\n"
-    filename: macos-native-readiness.md
+  - content: "---\npackages:\n  cargo:satelle:\n    type: patch\n---\n\n## Interrupted macOS setup\n\nRecover an interrupted native prerequisite check with `satelle host recover-bootstrap`. Recovery validates the installed signed components, reconciles the exact abandoned operation and preserves its claim with a durable receipt. The old setup remains a partial failure; run normal setup again afterward.\n\n## Failed macOS prerequisite checks\n\nRelease setup ownership normally when a macOS prerequisite check fails without changing the host. Missing or untrusted components still fail validation.\n\n## Repair planning\n\nLet activated setup credentials read the update evidence needed to plan persistent Host service repairs and updates. Ordinary read and control credentials retain their existing limits, and storage cleanup still requires admin scope.\n"
+    filename: macos-setup-recovery.md
     v: 0.0.0
 core:packages:
   - id: npm:satelle-repository
@@ -8,7 +8,7 @@ core:packages:
   - id: npm:satelle-docs
     updated: false
   - changelogIds:
-      - macos-native-readiness.md
+      - macos-setup-recovery.md
     id: cargo:satelle
     updated: true
 npm:packages:

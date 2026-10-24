@@ -1,3 +1,17 @@
+## satelle@0.1.43
+
+### Interrupted macOS setup
+
+Recover an interrupted native prerequisite check with `satelle host recover-bootstrap`. Recovery validates the installed signed components, reconciles the exact abandoned operation and preserves its claim with a durable receipt. The old setup remains a partial failure; run normal setup again afterward.
+
+### Failed macOS prerequisite checks
+
+Release setup ownership normally when a macOS prerequisite check fails without changing the host. Missing or untrusted components still fail validation.
+
+### Repair planning
+
+Let activated setup credentials read the update evidence needed to plan persistent Host service repairs and updates. Ordinary read and control credentials retain their existing limits, and storage cleanup still requires admin scope.
+
 ## satelle@0.1.42
 
 ### macOS Host lifecycle
