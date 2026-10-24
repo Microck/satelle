@@ -1970,6 +1970,7 @@
 - read scope authorizes readiness, status, Host session metadata, paths, and redacted logs @spec @mvp @implemented
 - control scope authorizes read operations plus run, steer, stop, and attachment upload @spec @mvp @implemented
 - admin scope authorizes control operations plus setup, repair, Host lifecycle, Host update, storage migration, token management, and destructive maintenance @spec @mvp @implemented
+- activated setup-issued CONTROL credentials retain the setup maintenance capability for persistent Host service repair and Host update, including read-only update evidence; ordinary READ and CONTROL credentials do not gain this capability, and storage-migration cleanup remains ADMIN-only @spec @mvp @implemented
 - diagnostics_sensitive scope is required in addition to command-specific consent for Raw Diagnostic Export, recording, and Desktop Snapshot Export operations @spec @mvp @implemented
 - transport authorization never substitutes for mutation consent, provider-secret consent, raw-diagnostic consent, recording consent, desktop-snapshot consent, or YOLO selection @spec @mvp @implemented
 - a request with valid authentication but insufficient scope fails with a typed authorization-insufficient-scope error @spec @mvp @implemented

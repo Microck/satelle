@@ -1,5 +1,7 @@
 use super::api_json::{ApiJson, BoundedBodyError, read_bounded_body};
-use super::auth::{self, AuthorizedRequest};
+use super::auth::{
+    self, AuthorizedRequest, persistent_service_maintenance_principal_is_authorized,
+};
 use super::{ApiFailure, DaemonState, api_error_response, authenticated_json_response, host_error};
 use crate::core::SatelleError;
 use crate::host::{ApiScopes, HostService, MutationAuthority, SetupOperationKind};
@@ -1559,12 +1561,6 @@ fn setup_principal_is_authorized(authorized: &AuthorizedRequest) -> bool {
 // needs it even when the daemon exposes only read operations to that client.
 fn bootstrap_maintenance_principal_is_authorized(authorized: &AuthorizedRequest) -> bool {
     authorized.principal().is_ssh_bootstrap()
-}
-
-fn persistent_service_maintenance_principal_is_authorized(authorized: &AuthorizedRequest) -> bool {
-    let principal = authorized.principal();
-    (principal.is_ssh_bootstrap() && principal.scopes().allows(ApiScopes::ADMIN))
-        || (principal.is_durable_setup_active() && principal.scopes() == ApiScopes::CONTROL)
 }
 
 fn setup_principal_can_activate(authorized: &AuthorizedRequest, token_id: &str) -> bool {

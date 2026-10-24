@@ -971,14 +971,27 @@ fn router(state: Arc<DaemonState>) -> Router {
             Arc::clone(&state),
             auth::require_protocol_read,
         ));
+    let maintenance_evidence_read_route = Router::new()
+        .route(
+            "/v1/maintenance/update-evidence",
+            get(maintenance_update_evidence),
+        )
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::require_empty_read,
+        ))
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::require_protocol_read,
+        ))
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::require_maintenance_evidence_read,
+        ));
     let maintenance_read_route = Router::new()
         .route(
             "/v1/maintenance/storage-migration/{operation_id}/source/cleanup",
             get(setup::plan_storage_migration_cleanup),
-        )
-        .route(
-            "/v1/maintenance/update-evidence",
-            get(maintenance_update_evidence),
         )
         .route_layer(middleware::from_fn_with_state(
             Arc::clone(&state),
@@ -1040,6 +1053,7 @@ fn router(state: Arc<DaemonState>) -> Router {
     let read_routes = bodyless_read_routes
         .merge(capabilities_route)
         .merge(maintenance_read_route)
+        .merge(maintenance_evidence_read_route)
         .merge(logs_route)
         .merge(raw_diagnostic_read_route)
         .route_layer(middleware::from_fn_with_state(
