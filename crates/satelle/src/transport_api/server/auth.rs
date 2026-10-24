@@ -604,6 +604,32 @@ pub(super) async fn require_admin_read(
     next.run(request).await
 }
 
+pub(super) fn persistent_service_maintenance_principal_is_authorized(
+    authorized: &AuthorizedRequest,
+) -> bool {
+    let principal = authorized.principal();
+    (principal.is_ssh_bootstrap() && principal.scopes().allows(ApiScopes::ADMIN))
+        || (principal.is_durable_setup_active() && principal.scopes() == ApiScopes::CONTROL)
+}
+
+pub(super) async fn require_maintenance_evidence_read(
+    State(state): State<Arc<DaemonState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let Some(authorized) = request.extensions().get::<AuthorizedRequest>() else {
+        return missing_authorization_context();
+    };
+    // Planning must accept the same setup-issued maintenance capability as
+    // repair application, without granting that authority to ordinary Control.
+    if !authorized.principal().scopes().allows(ApiScopes::ADMIN)
+        && !persistent_service_maintenance_principal_is_authorized(authorized)
+    {
+        return insufficient_scope(&state, authorized, "admin");
+    }
+    next.run(request).await
+}
+
 pub(super) async fn require_empty_read(
     State(state): State<Arc<DaemonState>>,
     request: Request,

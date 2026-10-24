@@ -1470,7 +1470,7 @@ async fn capabilities_are_truthful_and_unknown_routes_are_typed() {
 }
 
 #[tokio::test]
-async fn live_maintenance_update_evidence_requires_admin_scope() {
+async fn live_maintenance_update_evidence_rejects_ordinary_read_and_control() {
     for (scope_name, scopes) in [("read", ApiScopes::READ), ("control", ApiScopes::CONTROL)] {
         let running = RunningServer::start(scopes).await;
         let response = running
@@ -3201,6 +3201,16 @@ async fn ssh_bootstrap_issues_and_activates_one_durable_restart_credential() {
                 ..
             }
         ));
+        assert!(
+            matches!(
+                pending_client.maintenance_update_evidence(),
+                Err(DaemonClientError::Api {
+                    status: StatusCode::UNAUTHORIZED,
+                    ..
+                })
+            ),
+            "pending setup credentials cannot read maintenance evidence"
+        );
         let activated = bootstrap_client
             .activate_durable_setup_token(&token_id, "activate-durable-setup-token")
             .expect("activate durable token");
@@ -3247,6 +3257,19 @@ async fn ssh_bootstrap_issues_and_activates_one_durable_restart_credential() {
         assert_eq!(confirmation.token_id(), token_id);
         assert!(confirmation.setup_active());
         assert!(confirmation.control_scoped());
+        durable_client
+            .maintenance_update_evidence()
+            .expect("activated setup credential can plan its maintenance operations");
+        assert!(
+            matches!(
+                durable_client.preview_storage_migration_source("no-storage-operation"),
+                Err(DaemonClientError::Api {
+                    status: StatusCode::FORBIDDEN,
+                    ..
+                })
+            ),
+            "setup maintenance does not authorize storage cleanup planning"
+        );
         let ordinary_client = DaemonClient::loopback(
             first_address,
             ordinary_control_token,
@@ -3263,6 +3286,16 @@ async fn ssh_bootstrap_issues_and_activates_one_durable_restart_credential() {
                 ..
             }
         ));
+        assert!(
+            matches!(
+                ordinary_client.maintenance_update_evidence(),
+                Err(DaemonClientError::Api {
+                    status: StatusCode::FORBIDDEN,
+                    ..
+                })
+            ),
+            "ordinary control is not the setup maintenance capability"
+        );
         let error = durable_client
             .issue_durable_setup_token("durable-principal-setup-attempt")
             .expect_err("durable principal cannot mint another setup token");
@@ -3283,7 +3316,7 @@ async fn ssh_bootstrap_issues_and_activates_one_durable_restart_credential() {
     let restarted_service = HostService::local_demo_for_tests_at(state.path())
         .expect("construct restarted Host service");
     let restarted_server = DaemonServer::bind(
-        restarted_service,
+        restarted_service.clone(),
         DaemonServerConfig::loopback(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
     )
     .await
@@ -3301,6 +3334,22 @@ async fn ssh_bootstrap_issues_and_activates_one_durable_restart_credential() {
             .confirm_durable_setup_token()
             .expect("setup provenance survives Host restart");
         assert_eq!(confirmation.token_id(), restart_token_id);
+        restarted_client
+            .maintenance_update_evidence()
+            .expect("setup maintenance capability survives restart");
+        restarted_service
+            .revoke_api_token(&restart_token_id)
+            .expect("revoke the setup credential");
+        assert!(
+            matches!(
+                restarted_client.maintenance_update_evidence(),
+                Err(DaemonClientError::Api {
+                    status: StatusCode::UNAUTHORIZED,
+                    ..
+                })
+            ),
+            "revoked setup credentials lose maintenance evidence access"
+        );
     })
     .await
     .expect("join restarted client operation");
