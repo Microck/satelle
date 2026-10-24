@@ -70,7 +70,7 @@ Requests expire when the operation ends or after five minutes at most. Re-read
 pending requests before answering a stale ID. A saved app grant is never code
 consent. Do not infer either consent from task authorization, YOLO, or `--yes`.
 Never edit native app policy files. OS privacy and administrator prompts still
-require the human on the device. Clients and Hosts must share protocol 23;
+require the human on the device. Clients and Hosts must share protocol 24;
 old app-only payloads are not accepted.
 
 ## Output Formats

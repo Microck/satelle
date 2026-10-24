@@ -45,6 +45,22 @@ It does not weaken native admission or permit an uncertain mutation to be
 treated as unchanged. Use Doctor to inspect the native readiness cause.
 Readiness errors alone do not release a managed setup fence.
 
+## Interpret Codex maintenance evidence
+
+The minimum supported Codex version is a compatibility floor, not a replacement
+release. A `null` update or repair `target_version` means no concrete replacement
+has been selected. Normal setup continues to select the latest official stable
+standalone Codex release.
+
+Fresh maintenance evidence reports `native_prerequisites` as `not_observed`,
+`validated`, `missing`, `untrusted`, `not_ready`, or `unavailable`. Unperformed
+live checks do not establish an incompatible runtime or missing component.
+A missing native version value also does not establish a missing installation;
+the standalone CLI version does not identify its separately signed native SDK.
+
+Validated installation prerequisites do not prove live computer-use readiness.
+Use the explicit Doctor refresh above to test native actions and permissions.
+
 ## Read normalized logs
 
 ```sh
@@ -106,3 +122,5 @@ processes. Stop those processes before resetting the store. When their state
 cannot be established, reboot the machine before reset. Normal restart and
 timeout recovery still retain uncertain leases; reset is an explicit deletion
 of the stored history.
+
+The maintenance evidence contract uses protocol 24. Update the controller and Host together; a protocol mismatch reports incompatibility before decoding maintenance evidence.

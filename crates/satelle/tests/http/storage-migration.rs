@@ -226,7 +226,7 @@ async fn storage_migration_completion_checks_admin_paths_and_durable_staging_bef
     std::fs::write(&copied_log, b"original log\n").unwrap();
     let preview = server.request(&cleanup_endpoint).send().await.unwrap();
     assert_eq!(preview.status(), StatusCode::OK);
-    assert_eq!(preview.headers()["Satelle-Protocol-Version"], "23");
+    assert_eq!(preview.headers()["Satelle-Protocol-Version"], "24");
     assert!(std::path::Path::new(&source_paths.sqlite_store).exists());
     let cleaned = server
         .mutation(&cleanup_endpoint, "cleanup-source")

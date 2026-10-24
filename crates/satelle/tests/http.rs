@@ -1871,7 +1871,7 @@ async fn bootstrap_maintenance_routes_enforce_the_mutation_contract_before_ledge
         ),
         (
             "missing-idempotency",
-            Some("23"),
+            Some("24"),
             None,
             false,
             false,
@@ -1880,7 +1880,7 @@ async fn bootstrap_maintenance_routes_enforce_the_mutation_contract_before_ledge
         ),
         (
             "query",
-            Some("23"),
+            Some("24"),
             Some("query-key"),
             true,
             false,
@@ -1889,7 +1889,7 @@ async fn bootstrap_maintenance_routes_enforce_the_mutation_contract_before_ledge
         ),
         (
             "cookie",
-            Some("23"),
+            Some("24"),
             Some("cookie-key"),
             false,
             true,
@@ -2002,7 +2002,7 @@ async fn bootstrap_maintenance_routes_enforce_the_mutation_contract_before_ledge
         ),
         (
             "missing-idempotency",
-            Some("23"),
+            Some("24"),
             None,
             false,
             false,
@@ -2011,7 +2011,7 @@ async fn bootstrap_maintenance_routes_enforce_the_mutation_contract_before_ledge
         ),
         (
             "query",
-            Some("23"),
+            Some("24"),
             Some("complete-query-key"),
             true,
             false,
@@ -2020,7 +2020,7 @@ async fn bootstrap_maintenance_routes_enforce_the_mutation_contract_before_ledge
         ),
         (
             "cookie",
-            Some("23"),
+            Some("24"),
             Some("complete-cookie-key"),
             false,
             true,

@@ -8541,7 +8541,7 @@ mod error_contract_tests {
                 action_id: "repair-host-daemon".to_string(),
                 target: crate::core::host_update::HostUpdateTarget::HostDaemon,
                 current_version: Some("1.0.0".to_string()),
-                target_version: "1.1.0".to_string(),
+                target_version: Some("1.1.0".to_string()),
                 compatibility_reason: Some(RepairCompatibilityReason::BelowMinimumVersion),
                 version_source:
                     crate::core::host_update::HostUpdateVersionSource::HostCompatibilityRequirement,

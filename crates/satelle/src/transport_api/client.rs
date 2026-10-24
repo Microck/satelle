@@ -231,20 +231,28 @@ impl DaemonClient {
     }
 
     pub fn capabilities(&self) -> Result<CapabilitiesResponse, DaemonClientError> {
-        self.protocol_read("/v1/capabilities")
+        self.protocol_read("/v1/capabilities", None)
     }
 
     pub fn maintenance_update_evidence(
         &self,
     ) -> Result<MaintenanceUpdateEvidenceResponse, DaemonClientError> {
-        self.protocol_read("/v1/maintenance/update-evidence")
+        self.protocol_read(
+            "/v1/maintenance/update-evidence",
+            Some(crate::host::MAINTENANCE_EVIDENCE_REQUEST_TIMEOUT),
+        )
     }
 
     fn protocol_read<T: DeserializeOwned + AuthenticatedResponseContract>(
         &self,
         path: &str,
+        timeout: Option<Duration>,
     ) -> Result<T, DaemonClientError> {
         let (request, request_id) = self.protected_request(Method::GET, path)?;
+        let request = match timeout {
+            Some(timeout) => request.timeout(timeout),
+            None => request,
+        };
         let response = request
             .header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION)
             .send()
@@ -677,7 +685,7 @@ impl DaemonClient {
         operation_id: &str,
     ) -> Result<crate::transport::StorageMigrationCleanupResponse, DaemonClientError> {
         let path = format!("/v1/maintenance/storage-migration/{operation_id}/source/cleanup");
-        self.protocol_read(&path)
+        self.protocol_read(&path, None)
     }
 
     pub fn cleanup_storage_migration_source(
@@ -1917,45 +1925,55 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_rejects_protocol_mismatch_before_decoding_the_current_schema() {
-        for protocol_header in ["", "Satelle-Protocol-Version: 5\r\n"] {
-            let listener = TcpListener::bind("127.0.0.1:0").expect("bind legacy daemon fixture");
-            let address = listener.local_addr().expect("read legacy daemon address");
-            let token = ApiBearerToken::generate().expect("generate daemon token");
-            let server = std::thread::spawn(move || {
-                let (mut stream, _) = listener.accept().expect("accept capabilities client");
-                let mut request = Vec::new();
-                let mut chunk = [0_u8; 1024];
-                while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
-                    let read = stream.read(&mut chunk).expect("read capabilities request");
-                    assert_ne!(read, 0, "capabilities request ended before its headers");
-                    request.extend_from_slice(&chunk[..read]);
-                }
-                let request = String::from_utf8(request).expect("request headers should be UTF-8");
-                assert!(request.starts_with("GET /v1/capabilities HTTP/1.1\r\n"));
-                assert_eq!(
-                    header_value(&request, PROTOCOL_VERSION_HEADER),
-                    Some(PROTOCOL_VERSION)
-                );
-                let request_id = header_value(&request, "satelle-request-id")
-                    .expect("request must carry a request ID");
-                let body = r#"{"schema_version":"satelle.capabilities.v2"}"#;
-                write!(
+    fn protocol_reads_reject_old_peers_before_decoding_the_current_schema() {
+        for path in ["/v1/capabilities", "/v1/maintenance/update-evidence"] {
+            for protocol_header in [
+                "",
+                "Satelle-Protocol-Version: 5\r\n",
+                "Satelle-Protocol-Version: 23\r\n",
+            ] {
+                let listener =
+                    TcpListener::bind("127.0.0.1:0").expect("bind legacy daemon fixture");
+                let address = listener.local_addr().expect("read legacy daemon address");
+                let token = ApiBearerToken::generate().expect("generate daemon token");
+                let server = std::thread::spawn(move || {
+                    let (mut stream, _) = listener.accept().expect("accept capabilities client");
+                    let mut request = Vec::new();
+                    let mut chunk = [0_u8; 1024];
+                    while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                        let read = stream.read(&mut chunk).expect("read capabilities request");
+                        assert_ne!(read, 0, "capabilities request ended before its headers");
+                        request.extend_from_slice(&chunk[..read]);
+                    }
+                    let request =
+                        String::from_utf8(request).expect("request headers should be UTF-8");
+                    assert!(request.starts_with(&format!("GET {path} HTTP/1.1\r\n")));
+                    assert_eq!(
+                        header_value(&request, PROTOCOL_VERSION_HEADER),
+                        Some(PROTOCOL_VERSION)
+                    );
+                    let request_id = header_value(&request, "satelle-request-id")
+                        .expect("request must carry a request ID");
+                    let body = r#"{"schema_version":"satelle.capabilities.v2"}"#;
+                    write!(
                     stream,
                     "HTTP/1.1 200 OK\r\n{protocol_header}Satelle-Request-Id: {request_id}\r\nSatelle-Host-Identity: host-legacy-protocol\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
                 )
                 .expect("write legacy capabilities response");
-                stream.flush().expect("flush legacy capabilities response");
-            });
+                    stream.flush().expect("flush legacy capabilities response");
+                });
 
-            let client = DaemonClient::loopback(address, token, "host-legacy-protocol")
-                .expect("construct capabilities client");
-            let error = client
-                .capabilities()
+                let client = DaemonClient::loopback(address, token, "host-legacy-protocol")
+                    .expect("construct capabilities client");
+                let error = match path {
+                    "/v1/capabilities" => client.capabilities().map(|_| ()),
+                    _ => client.maintenance_update_evidence().map(|_| ()),
+                }
                 .expect_err("a response without the current protocol header must fail closed");
-            assert!(matches!(error, DaemonClientError::ProtocolResponseMismatch));
-            server.join().expect("join legacy daemon fixture");
+                assert!(matches!(error, DaemonClientError::ProtocolResponseMismatch));
+                server.join().expect("join legacy daemon fixture");
+            }
         }
     }
 
@@ -2443,6 +2461,73 @@ mod tests {
                 .unwrap();
             assert_eq!(request.timeout(), Some(&Duration::from_secs(245)));
         }
+    }
+
+    #[test]
+    fn maintenance_evidence_timeout_preserves_authenticated_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut bytes = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            while !bytes.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let read = stream.read(&mut chunk).unwrap();
+                assert_ne!(read, 0);
+                bytes.extend_from_slice(&chunk[..read]);
+            }
+            let headers = String::from_utf8(bytes).unwrap();
+            assert!(headers.starts_with("GET /v1/maintenance/update-evidence HTTP/1.1\r\n"));
+            let request_id =
+                RequestId::parse(header_value(&headers, "satelle-request-id").unwrap()).unwrap();
+            std::thread::sleep(Duration::from_millis(150));
+            let evidence = crate::core::host_update::CodexUpdateEvidence {
+                availability: crate::core::host_update::CodexUpdateAvailability::Available,
+                runtime_ownership: crate::core::host_update::CodexComponentOwnership::CodexOwned,
+                native_component_ownership:
+                    crate::core::host_update::CodexComponentOwnership::CodexOwned,
+                runtime_current_version: Some("0.164.0".to_string()),
+                native_component_current_version: None,
+                native_prerequisites: crate::core::host_update::NativePrerequisiteStatus::Validated,
+                required_version: "0.144.0".to_string(),
+                runtime_update_required: false,
+                native_update_required: false,
+                runtime_compatibility_reason: None,
+                native_component_compatibility_reason: None,
+            };
+            let response = MaintenanceUpdateEvidenceResponse::new(
+                request_id.clone(),
+                "host-maintenance-timeout".to_string(),
+                evidence,
+            );
+            let body = serde_json::to_string(&response).unwrap();
+            write!(stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nsatelle-request-id: {}\r\nsatelle-host-identity: host-maintenance-timeout\r\n{}: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len(), request_id.as_str(), PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION,
+            ).unwrap();
+        });
+        let client = DaemonClient::loopback_with_timeout(
+            address,
+            ApiBearerToken::generate().unwrap(),
+            "host-maintenance-timeout",
+            Duration::from_millis(50),
+        )
+        .unwrap();
+        let response = client.maintenance_update_evidence();
+        server.join().unwrap();
+        let response =
+            response.expect("bounded maintenance work must outlive the short read timeout");
+        assert_eq!(
+            response.codex_update_evidence().native_prerequisites,
+            crate::core::host_update::NativePrerequisiteStatus::Validated
+        );
+        assert_eq!(
+            response
+                .codex_update_evidence()
+                .runtime_current_version
+                .as_deref(),
+            Some("0.164.0")
+        );
     }
 
     #[test]
