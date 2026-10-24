@@ -21,18 +21,26 @@ mod control_plane;
 pub(crate) use control_plane::{
     CodexImageInputMode, ControlPlaneAdmission, NativeComputerUseActionPath,
     NativeSessionResources, VerifiedComputerUseAppServer, installed_computer_use_app_server,
-    installed_read_only_app_server_command, provision_native_computer_use,
+    installed_read_only_app_server_command, observe_native_computer_use_prerequisites,
+    provision_native_computer_use,
 };
 
 #[cfg(test)]
 #[path = "runtime-codex-tests.rs"]
-mod control_plane_tests;
+pub(super) mod control_plane_tests;
 
 const VERSION_OUTPUT_LIMIT: u64 = 129;
 // A cold Windows app process can take tens of seconds to answer while WAA or
 // another desktop reset is closing applications. Match the managed-install
 // probe budget so the same valid runtime can publish its capability snapshot.
 pub(crate) const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
+// Maintenance observes these phases sequentially. Keep the HTTP read deadline
+// tied to the owner budgets, with room for process cleanup and response delivery.
+pub(crate) const MAINTENANCE_EVIDENCE_REQUEST_TIMEOUT: Duration = VERSION_PROBE_TIMEOUT
+    .saturating_add(control_plane::PROBE_TIMEOUT)
+    .saturating_add(APP_POLICY_PROBE_TIMEOUT.saturating_mul(APP_POLICY_PROBE_ATTEMPTS))
+    .saturating_add(control_plane::NATIVE_ISOLATION_TIMEOUT)
+    .saturating_add(Duration::from_secs(10));
 const VERSION_PROBE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const APP_POLICY_MESSAGE_LIMIT: usize = 128;
 const APP_POLICY_LINE_LIMIT: u64 = 2 * 1024 * 1024;

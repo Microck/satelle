@@ -795,7 +795,10 @@ pub(crate) fn provision_native_computer_use(
     }
     #[cfg(target_os = "macos")]
     {
-        validate_macos_computer_use_prerequisites(runtime)
+        let deadline = Instant::now()
+            .checked_add(NATIVE_ISOLATION_TIMEOUT)
+            .ok_or_else(|| codex_isolation_error("inventory_deadline_invalid"))?;
+        validate_native_computer_use_prerequisites(runtime, deadline)
             .map_err(macos_setup_prerequisite_error)?;
         Ok(false)
     }
@@ -806,27 +809,81 @@ pub(crate) fn provision_native_computer_use(
     }
 }
 
-#[cfg(target_os = "macos")]
-fn validate_macos_computer_use_prerequisites(
+/// Validates the installed integration without installing plugins, changing
+/// approvals, staging bridges, or launching a native action. Upstream inventory
+/// commands may maintain their own metadata cache.
+pub(crate) fn validate_native_computer_use_prerequisites(
     runtime: &crate::host::codex_install::VerifiedCodexRuntime,
+    deadline: Instant,
 ) -> Result<(), SatelleError> {
-    let deadline = Instant::now()
-        .checked_add(NATIVE_ISOLATION_TIMEOUT)
-        .ok_or_else(|| codex_isolation_error("inventory_deadline_invalid"))?;
-    let computer_use_codex_home = runtime.codex_home();
+    #[cfg(target_os = "macos")]
     let [plugin_command, mcp_command] = computer_use_runtime_commands(runtime, deadline)?;
-    let (isolation, trusted_native_bridge_root, deadline) = configured_codex_isolation(
-        computer_use_codex_home,
-        plugin_command,
-        mcp_command,
-        deadline,
-    )?;
-    authenticated_macos_native_bridge_cdhash(
-        Path::new(&isolation.native_mcp_binding.command),
-        &trusted_native_bridge_root,
-        deadline,
-    )?;
-    Ok(())
+    #[cfg(windows)]
+    let [plugin_command, mcp_command] = runtime.commands()?;
+    #[cfg(any(windows, target_os = "macos"))]
+    {
+        let (isolation, trusted_root, deadline) = configured_codex_isolation(
+            runtime.codex_home(),
+            plugin_command,
+            mcp_command,
+            deadline,
+        )?;
+        let bridge = Path::new(&isolation.native_mcp_binding.command);
+        #[cfg(target_os = "macos")]
+        authenticated_macos_native_bridge_cdhash(bridge, &trusted_root, deadline)?;
+        #[cfg(windows)]
+        {
+            let _ = deadline;
+            validated_windows_native_bridge_digest(bridge, &trusted_root)?;
+        }
+        Ok(())
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let _ = (runtime, deadline);
+        Err(codex_isolation_error("native_bridge_platform_unsupported"))
+    }
+}
+
+pub(crate) fn observe_native_computer_use_prerequisites()
+-> crate::core::host_update::NativePrerequisiteStatus {
+    use crate::core::host_update::NativePrerequisiteStatus;
+    let Some(deadline) = Instant::now().checked_add(NATIVE_ISOLATION_TIMEOUT) else {
+        return NativePrerequisiteStatus::Unavailable;
+    };
+    let observation = crate::host::codex_install::admit_managed_codex_for_current_process()
+        .and_then(|runtime| validate_native_computer_use_prerequisites(&runtime, deadline));
+    match observation {
+        Ok(()) => NativePrerequisiteStatus::Validated,
+        Err(_) if Instant::now() >= deadline => NativePrerequisiteStatus::Unavailable,
+        Err(error) => native_prerequisite_failure_status(&error),
+    }
+}
+
+pub(super) fn native_prerequisite_failure_status(
+    error: &SatelleError,
+) -> crate::core::host_update::NativePrerequisiteStatus {
+    use crate::core::host_update::NativePrerequisiteStatus;
+    match error.details.get("reason").and_then(Value::as_str) {
+        Some(
+            "codex_app_runtime_missing"
+            | "computer_use_service_missing"
+            | "computer_use_plugin_missing"
+            | "native_bridge_missing",
+        ) => NativePrerequisiteStatus::Missing,
+        Some(
+            "native_bridge_untrusted"
+            | "codex_app_runtime_untrusted"
+            | "computer_use_service_untrusted"
+            | "native_bridge_inventory_untrusted"
+            | "computer_use_plugin_source_untrusted"
+            | "plugin_marketplace_untrusted"
+            | "native_bridge_root_untrusted",
+        ) => NativePrerequisiteStatus::Untrusted,
+        Some("computer_use_plugin_not_ready") => NativePrerequisiteStatus::NotReady,
+        // Observation failure does not prove a missing or incompatible install.
+        _ => NativePrerequisiteStatus::Unavailable,
+    }
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -1283,10 +1340,7 @@ fn provision_windows_computer_use(
         .map_err(|error| mark_provision_changed(error, changed))?
         || changed;
 
-    let [plugin_command, mcp_command] = runtime
-        .commands()
-        .map_err(|error| mark_provision_changed(error, changed))?;
-    configured_codex_isolation(runtime.codex_home(), plugin_command, mcp_command, deadline)
+    validate_native_computer_use_prerequisites(runtime, deadline)
         .map_err(|error| mark_provision_changed(error, changed))?;
     Ok(changed)
 }
@@ -1318,7 +1372,13 @@ pub(super) fn bounded_inventory_command_output(
     unavailable_reason: &'static str,
     failed_reason: &'static str,
 ) -> Result<Vec<u8>, SatelleError> {
-    bounded_command_output(command, deadline, unavailable_reason, failed_reason)
+    bounded_command_output_from(
+        command,
+        deadline,
+        unavailable_reason,
+        failed_reason,
+        CommandOutputStream::Stdout,
+    )
 }
 
 #[cfg(windows)]
@@ -1381,22 +1441,50 @@ pub(super) fn bounded_mutation_command_output(
     )
 }
 
-fn bounded_command_output(
+#[derive(Clone, Copy)]
+pub(super) enum CommandOutputStream {
+    Stdout,
+    #[cfg(target_os = "macos")]
+    Stderr,
+}
+
+pub(super) fn bounded_command_output_from(
     mut command: Command,
     deadline: Instant,
     unavailable_reason: &'static str,
     failed_reason: &'static str,
+    stream: CommandOutputStream,
 ) -> Result<Vec<u8>, SatelleError> {
     if Instant::now() >= deadline {
         return Err(codex_isolation_error(unavailable_reason));
     }
+    command.stdin(Stdio::null());
+    match stream {
+        CommandOutputStream::Stdout => {
+            command.stdout(Stdio::piped()).stderr(Stdio::null());
+        }
+        #[cfg(target_os = "macos")]
+        CommandOutputStream::Stderr => {
+            command.stdout(Stdio::null()).stderr(Stdio::piped());
+        }
+    }
     let mut child = command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
         .group_spawn()
         .map_err(|_| codex_isolation_error(unavailable_reason))?;
-    let Some(stdout) = child.inner().stdout.take() else {
+    let pipe = match stream {
+        CommandOutputStream::Stdout => child.inner().stdout.take(),
+        #[cfg(target_os = "macos")]
+        CommandOutputStream::Stderr => {
+            // codesign emits identity on stderr. Transfer that owned pipe to
+            // the same bounded reader instead of adding an unbounded collector.
+            child
+                .inner()
+                .stderr
+                .take()
+                .map(|pipe| std::process::ChildStdout::from(std::os::fd::OwnedFd::from(pipe)))
+        }
+    };
+    let Some(stdout) = pipe else {
         let _ = super::terminate_group(&mut child);
         return Err(codex_isolation_error(unavailable_reason));
     };
@@ -1718,6 +1806,16 @@ fn normalized_windows_drive_path(path: &Path) -> Option<String> {
         .then(|| path.to_string())
 }
 
+fn validated_windows_native_bridge_digest(
+    path: &Path,
+    trusted_root: &Path,
+) -> Result<[u8; 32], SatelleError> {
+    validate_native_bridge_filesystem(path, trusted_root, "windows")?;
+    let digest = native_bridge_digest(path)?;
+    protected_windows_native_bridge(&digest)?;
+    Ok(digest)
+}
+
 fn prepare_native_bridge(
     path: &Path,
     trusted_root: &Path,
@@ -1731,13 +1829,9 @@ fn prepare_native_bridge(
             let _ = (codex_home, deadline);
             #[cfg(not(windows))]
             let _ = native_env;
-            validate_native_bridge_filesystem(path, trusted_root, platform)?;
-            // The inventory path lives in a user-writable runtime cache. The
-            // AppX copy authenticates its bytes, while protected PowerShell
-            // holds the checked cache file against writes and replacement
-            // until Windows has opened the child image.
-            let inventory_digest = native_bridge_digest(path)?;
-            protected_windows_native_bridge(&inventory_digest)?;
+            // Validation authenticates cache bytes against the protected AppX
+            // copy. Execution additionally locks those bytes until image open.
+            let inventory_digest = validated_windows_native_bridge_digest(path, trusted_root)?;
             #[cfg(windows)]
             let native_resources = {
                 let staging = windows_native_staging::WindowsNativeStaging::create().map_err(|_| {
@@ -1855,11 +1949,13 @@ fn prepare_macos_native_bridge(
     // every executable identity into readiness so a partial Desktop update
     // cannot reuse proof collected for a different app-server or service.
     let codex_binary = validate_macos_codex_app_layout(Path::new(MACOS_CODEX_APP_PATH))?;
-    let codex_cdhash = macos_path_cdhash(&codex_binary)
-        .ok_or_else(|| codex_isolation_error("codex_app_runtime_untrusted"))?;
+    let codex_cdhash = macos_path_cdhash(&codex_binary, deadline, "codex_app_runtime_untrusted")?;
     let computer_use_service = validate_macos_computer_use_service_layout(codex_home)?;
-    let service_cdhash = macos_path_cdhash(&computer_use_service)
-        .ok_or_else(|| codex_isolation_error("computer_use_service_untrusted"))?;
+    let service_cdhash = macos_path_cdhash(
+        &computer_use_service,
+        deadline,
+        "computer_use_service_untrusted",
+    )?;
 
     let mut nonce = [0_u8; 16];
     getrandom::fill(&mut nonce)
@@ -1902,7 +1998,8 @@ fn prepare_macos_native_bridge(
         launcher.sync_all()
     })();
     let launcher_is_trusted = copy_result.is_ok()
-        && macos_path_cdhash(&launcher_path).as_deref() == Some(parent_cdhash.as_str())
+        && macos_path_cdhash(&launcher_path, deadline, "native_bridge_launcher_untrusted")
+            .is_ok_and(|cdhash| cdhash == parent_cdhash)
         && macos_path_signature_valid(&launcher_path);
     if !launcher_is_trusted {
         let _ = fs::remove_file(&launcher_path);
@@ -1941,9 +2038,11 @@ fn authenticated_macos_native_bridge_cdhash(
     deadline: Instant,
 ) -> Result<String, SatelleError> {
     validate_native_bridge_filesystem(bridge, trusted_root, "macos")?;
-    macos_path_cdhash(bridge)
-        .filter(|_| macos_path_matches_openai_signature(bridge, deadline))
-        .ok_or_else(|| codex_isolation_error("native_bridge_untrusted"))
+    let cdhash = macos_path_cdhash(bridge, deadline, "native_bridge_untrusted")?;
+    if !macos_path_matches_openai_signature(bridge, deadline) {
+        return Err(codex_isolation_error("native_bridge_untrusted"));
+    }
+    Ok(cdhash)
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -2015,23 +2114,26 @@ fn macos_process_signature_valid(pid: u32) -> bool {
 }
 
 #[cfg(target_os = "macos")]
-fn macos_path_cdhash(path: &Path) -> Option<String> {
-    let output = Command::new("/usr/bin/codesign")
-        .arg("-dvvv")
-        .arg(path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    String::from_utf8_lossy(&output.stderr)
+fn macos_path_cdhash(
+    path: &Path,
+    deadline: Instant,
+    failed_reason: &'static str,
+) -> Result<String, SatelleError> {
+    let mut command = Command::new("/usr/bin/codesign");
+    command.arg("-dvvv").arg(path);
+    let output = bounded_command_output_from(
+        command,
+        deadline,
+        "native_signature_unavailable",
+        failed_reason,
+        CommandOutputStream::Stderr,
+    )?;
+    String::from_utf8_lossy(&output)
         .lines()
         .find_map(|line| line.strip_prefix("CDHash="))
         .filter(|cdhash| cdhash.len() == 40 && cdhash.bytes().all(|byte| byte.is_ascii_hexdigit()))
         .map(str::to_owned)
+        .ok_or_else(|| codex_isolation_error(failed_reason))
 }
 
 #[cfg(target_os = "macos")]
@@ -2903,12 +3005,24 @@ pub(super) fn official_native_bridge_root(
 ) -> Result<PathBuf, SatelleError> {
     let root = native_bridge_root_path(platform, codex_home)
         .ok_or_else(|| codex_isolation_error("native_bridge_root_unavailable"))?;
-    let metadata = fs::symlink_metadata(&root)
-        .map_err(|_| codex_isolation_error("native_bridge_root_unavailable"))?;
+    validate_native_bridge_root(&root, platform)
+}
+
+pub(super) fn validate_native_bridge_root(
+    root: &Path,
+    platform: &str,
+) -> Result<PathBuf, SatelleError> {
+    let metadata = fs::symlink_metadata(root).map_err(|error| {
+        codex_isolation_error(if error.kind() == std::io::ErrorKind::NotFound {
+            "native_bridge_missing"
+        } else {
+            "native_bridge_root_unavailable"
+        })
+    })?;
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
         return Err(codex_isolation_error("native_bridge_root_untrusted"));
     }
-    let canonical_root = fs::canonicalize(&root)
+    let canonical_root = fs::canonicalize(root)
         .map_err(|_| codex_isolation_error("native_bridge_root_untrusted"))?;
     if platform == "macos" && canonical_root != root {
         return Err(codex_isolation_error("native_bridge_root_untrusted"));

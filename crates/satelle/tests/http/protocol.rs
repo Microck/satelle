@@ -66,6 +66,7 @@ async fn protocol_version_gate_is_exact_sanitized_and_precedes_mutation_work() {
         "18",
         "19",
         "22",
+        "23",
         "65535",
         "65536",
         "99999999999999999999",
@@ -157,7 +158,7 @@ async fn capabilities_handshake_rejects_old_and_missing_clients() {
         .await
         .expect("send capabilities request with current protocol version");
     assert_eq!(current.status(), StatusCode::OK);
-    assert_eq!(current.headers()["satelle-protocol-version"], "23");
+    assert_eq!(current.headers()["satelle-protocol-version"], "24");
 }
 
 #[tokio::test]
@@ -217,7 +218,7 @@ async fn assert_protocol_error(
             "details": {
                 "daemon_version": env!("CARGO_PKG_VERSION"),
                 "reason": reason,
-                "supported_versions": ["23"],
+                "supported_versions": ["24"],
                 "received_version": received_version,
             },
             "docs_url": null,

@@ -565,8 +565,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_the_native_approval_subject_hard_cut() {
-        assert_eq!(PROTOCOL_VERSION, "23");
+    fn protocol_version_is_the_maintenance_evidence_hard_cut() {
+        assert_eq!(PROTOCOL_VERSION, "24");
     }
 
     #[test]

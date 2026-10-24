@@ -96,7 +96,7 @@ pub struct CodexUpdateInspection {
     pub evidence_available: bool,
     pub ownership: CodexComponentOwnership,
     pub current_version: Option<String>,
-    pub target_version: String,
+    pub target_version: Option<String>,
     pub update_required: bool,
     pub automation_is_safe: bool,
     pub restart_impact: HostUpdateRestartImpact,
@@ -107,7 +107,7 @@ pub struct CodexUpdateInspection {
 pub struct RepairUpgradeInspection {
     pub target: HostUpdateTarget,
     pub current_version: Option<String>,
-    pub target_version: String,
+    pub target_version: Option<String>,
     pub compatibility_reason: Option<RepairCompatibilityReason>,
     pub version_source: HostUpdateVersionSource,
     pub automation_is_safe: bool,
@@ -272,7 +272,7 @@ fn plan_host_targets(
     let mut targets = vec![HostUpdateTargetPlan {
         target: HostUpdateTarget::HostDaemon,
         current_version: request.host_inspection.current_version.clone(),
-        target_version: request.target_version.to_string(),
+        target_version: Some(request.target_version.to_string()),
         version_source: request.version_source,
         artifact_digest: if daemon_mutations.is_empty() {
             None
@@ -312,7 +312,7 @@ fn plan_host_targets(
         targets.push(HostUpdateTargetPlan {
             target: HostUpdateTarget::HostDaemonService,
             current_version: service.current_version.clone(),
-            target_version: request.target_version.to_string(),
+            target_version: Some(request.target_version.to_string()),
             version_source: request.version_source,
             artifact_digest,
             disposition,
@@ -451,7 +451,7 @@ pub fn codex_inspections_from_evidence(
             evidence_available: evidence.availability == CodexUpdateAvailability::Available,
             ownership: evidence.runtime_ownership,
             current_version: evidence.runtime_current_version.clone(),
-            target_version: evidence.required_version.clone(),
+            target_version: None,
             update_required: evidence.runtime_update_required,
             // Codex installation ownership is known, but no current transport
             // owns a safe replacement executor.
@@ -467,7 +467,7 @@ pub fn codex_inspections_from_evidence(
             evidence_available: evidence.availability == CodexUpdateAvailability::Available,
             ownership: evidence.native_component_ownership,
             current_version: evidence.native_component_current_version.clone(),
-            target_version: evidence.required_version.clone(),
+            target_version: None,
             update_required: evidence.native_update_required,
             automation_is_safe: false,
             restart_impact: HostUpdateRestartImpact::NativeComputerUse,
@@ -479,14 +479,14 @@ pub fn codex_inspections_from_evidence(
     ]
 }
 
-pub fn unavailable_codex_inspections(required_version: &str) -> [CodexUpdateInspection; 2] {
+pub fn unavailable_codex_inspections() -> [CodexUpdateInspection; 2] {
     [
         CodexUpdateInspection {
             target: HostUpdateTarget::CodexRuntime,
             evidence_available: false,
             ownership: CodexComponentOwnership::Ambiguous,
             current_version: None,
-            target_version: required_version.to_string(),
+            target_version: None,
             update_required: false,
             automation_is_safe: false,
             restart_impact: HostUpdateRestartImpact::None,
@@ -497,7 +497,7 @@ pub fn unavailable_codex_inspections(required_version: &str) -> [CodexUpdateInsp
             evidence_available: false,
             ownership: CodexComponentOwnership::Ambiguous,
             current_version: None,
-            target_version: required_version.to_string(),
+            target_version: None,
             update_required: false,
             automation_is_safe: false,
             restart_impact: HostUpdateRestartImpact::None,
@@ -658,7 +658,7 @@ pub(crate) fn render_host_update_plain(
                 phase,
                 status,
                 target.current_version.as_deref().unwrap_or("-"),
-                &target.target_version,
+                target.target_version.as_deref().unwrap_or("-"),
                 if changed { "true" } else { "false" },
                 if target.restart_impact == HostUpdateRestartImpact::None {
                     "false"
@@ -734,6 +734,11 @@ pub fn render_host_update_plan(report: &HostUpdateReport) -> String {
                 "managed asset; version unavailable"
             }
             (_, Some(version), _) => version,
+            (
+                HostUpdateTarget::CodexRuntime | HostUpdateTarget::CodexNativeComputerUse,
+                None,
+                _,
+            ) => "version not observed",
             (_, None, _) => "not installed",
         };
         let _ = writeln!(
@@ -741,7 +746,7 @@ pub fn render_host_update_plan(report: &HostUpdateReport) -> String {
             "- {:?}: {} -> {} ({:?}, restart: {:?})",
             target.target,
             current,
-            target.target_version,
+            target.target_version.as_deref().unwrap_or("not selected"),
             target.disposition,
             target.restart_impact
         );
@@ -795,7 +800,13 @@ pub fn render_repair_upgrade_plan(
         report.ledger_status, report.plan_source
     );
     for action in &report.actions {
-        let current = action.current_version.as_deref().unwrap_or("not installed");
+        let current = action.current_version.as_deref().unwrap_or(
+            if action.compatibility_reason == Some(RepairCompatibilityReason::Missing) {
+                "not installed"
+            } else {
+                "version not observed"
+            },
+        );
         let reason = action
             .compatibility_reason
             .map_or("none".to_string(), |reason| format!("{reason:?}"));
@@ -804,7 +815,7 @@ pub fn render_repair_upgrade_plan(
             "- {:?}: {} -> {} ({:?}, reason: {}, source: {:?})",
             action.target,
             current,
-            action.target_version,
+            action.target_version.as_deref().unwrap_or("not selected"),
             action.disposition,
             reason,
             action.version_source
@@ -921,7 +932,7 @@ mod tests {
             assert_eq!(report.targets.len(), 2);
             for target in &report.targets {
                 assert_eq!(target.current_version.as_deref(), Some(current));
-                assert_eq!(target.target_version, "1.2.3");
+                assert_eq!(target.target_version.as_deref(), Some("1.2.3"));
                 assert_eq!(
                     target.version_source,
                     HostUpdateVersionSource::ExplicitRelease
@@ -1066,7 +1077,7 @@ mod tests {
                 evidence_available: true,
                 ownership: CodexComponentOwnership::CodexOwned,
                 current_version: Some("0.9.0".to_string()),
-                target_version: "1.0.0".to_string(),
+                target_version: Some("1.0.0".to_string()),
                 update_required: true,
                 automation_is_safe: true,
                 restart_impact: HostUpdateRestartImpact::CodexRuntime,
@@ -1080,7 +1091,7 @@ mod tests {
                 evidence_available: true,
                 ownership: CodexComponentOwnership::CodexOwned,
                 current_version: None,
-                target_version: "1.0.0".to_string(),
+                target_version: Some("1.0.0".to_string()),
                 update_required: true,
                 automation_is_safe: true,
                 restart_impact: HostUpdateRestartImpact::NativeComputerUse,
@@ -1151,7 +1162,7 @@ mod tests {
             matches!(
                 target.target,
                 HostUpdateTarget::HostDaemon | HostUpdateTarget::HostDaemonService
-            ) && target.target_version == "1.2.3"
+            ) && target.target_version.as_deref() == Some("1.2.3")
                 && target.version_source == HostUpdateVersionSource::InvokingCliRelease
         }));
         assert_eq!(report.targets[1].current_version, None);
@@ -1348,7 +1359,7 @@ mod tests {
                 evidence_available: true,
                 ownership: CodexComponentOwnership::CodexOwned,
                 current_version: Some("1.0.0".to_string()),
-                target_version: "1.0.0".to_string(),
+                target_version: Some("1.0.0".to_string()),
                 update_required: false,
                 automation_is_safe: false,
                 restart_impact: HostUpdateRestartImpact::CodexRuntime,
@@ -1444,7 +1455,7 @@ mod tests {
     #[test]
     fn unavailable_codex_evidence_is_skipped_by_default_but_blocks_explicit_selection() {
         let host = host_inspection(HostVersionRelation::Older);
-        let unavailable = unavailable_codex_inspections("1.0.0");
+        let unavailable = unavailable_codex_inspections();
 
         build_host_update_plan(
             HostUpdatePlanRequest {
@@ -1485,7 +1496,7 @@ mod tests {
         }));
         assert!(
             render_host_update_plan(&report)
-                .contains("CodexRuntime: unavailable -> 1.0.0 (Skipped, restart: None)")
+                .contains("CodexRuntime: unavailable -> not selected (Skipped, restart: None)")
         );
 
         let error = build_host_update_plan(
@@ -1510,6 +1521,45 @@ mod tests {
     }
 
     #[test]
+    fn codex_compatibility_floor_is_not_a_selected_replacement() {
+        let evidence = CodexUpdateEvidence {
+            availability: CodexUpdateAvailability::Available,
+            runtime_ownership: CodexComponentOwnership::CodexOwned,
+            native_component_ownership: CodexComponentOwnership::CodexOwned,
+            runtime_current_version: Some("0.164.0".to_string()),
+            native_component_current_version: None,
+            native_prerequisites: satelle::core::host_update::NativePrerequisiteStatus::Validated,
+            required_version: "0.144.0".to_string(),
+            runtime_update_required: false,
+            native_update_required: false,
+            runtime_compatibility_reason: None,
+            native_component_compatibility_reason: None,
+        };
+        let inspections = codex_inspections_from_evidence(&evidence);
+        let targets = plan_codex_targets(&inspections, false).unwrap();
+        assert_eq!(targets.len(), 2);
+        assert!(targets.iter().all(|target| target.target_version.is_none()
+            && target.disposition == HostUpdateDisposition::Current
+            && !target.requires_mutation()));
+        let report = HostUpdateReport::new("office", vec![HostUpdateComponent::Codex], targets);
+        let plain = render_host_update_plain(&report, PlainUpdateStage::Plan);
+        assert!(
+            plain
+                .lines()
+                .all(|line| line.split('\t').nth(6) == Some("-"))
+        );
+        assert!(!plain.contains("0.144.0"));
+        let json = serde_json::to_value(&report).unwrap();
+        assert!(
+            json["targets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|target| target["target_version"].is_null())
+        );
+    }
+
+    #[test]
     fn unsupported_codex_platform_is_skipped_by_default_and_rejected_when_explicit() {
         let evidence = CodexUpdateEvidence {
             availability: CodexUpdateAvailability::UnsupportedHostPlatform,
@@ -1517,6 +1567,7 @@ mod tests {
             native_component_ownership: CodexComponentOwnership::CodexOwned,
             runtime_current_version: None,
             native_component_current_version: None,
+            native_prerequisites: satelle::core::host_update::NativePrerequisiteStatus::NotObserved,
             required_version: "1.0.0".to_string(),
             runtime_update_required: false,
             native_update_required: false,
@@ -1598,7 +1649,7 @@ mod tests {
             evidence_available: true,
             ownership: CodexComponentOwnership::Ambiguous,
             current_version: None,
-            target_version: "1.0.0".to_string(),
+            target_version: Some("1.0.0".to_string()),
             update_required: true,
             automation_is_safe: false,
             restart_impact: HostUpdateRestartImpact::NativeComputerUse,
@@ -1634,7 +1685,7 @@ mod tests {
             evidence_available: true,
             ownership: CodexComponentOwnership::CodexOwned,
             current_version: Some("0.9.0".to_string()),
-            target_version: "1.0.0".to_string(),
+            target_version: Some("1.0.0".to_string()),
             update_required: true,
             automation_is_safe: false,
             restart_impact: HostUpdateRestartImpact::CodexRuntime,
@@ -1711,7 +1762,7 @@ mod tests {
             &[RepairUpgradeInspection {
                 target: HostUpdateTarget::CodexRuntime,
                 current_version: Some("0.9.0".to_string()),
-                target_version: "1.0.0".to_string(),
+                target_version: Some("1.0.0".to_string()),
                 compatibility_reason: Some(RepairCompatibilityReason::ControlPlaneIncompatible),
                 version_source: HostUpdateVersionSource::CodexCompatibilityRequirement,
                 automation_is_safe: false,
@@ -1727,7 +1778,7 @@ mod tests {
                 action_id: "repair-codex-runtime".to_string(),
                 target: HostUpdateTarget::CodexRuntime,
                 current_version: Some("0.9.0".to_string()),
-                target_version: "1.0.0".to_string(),
+                target_version: Some("1.0.0".to_string()),
                 compatibility_reason: Some(RepairCompatibilityReason::ControlPlaneIncompatible,),
                 version_source: HostUpdateVersionSource::CodexCompatibilityRequirement,
                 disposition: RepairUpgradeDisposition::ManualActionRequired,

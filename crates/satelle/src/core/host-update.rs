@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 // Release packaging reads these constants for the signed compatibility asset.
 // Protocol handling and storage migrations enforce the same values below their
 // own boundaries, so a release cannot advertise a separate compatibility state.
-pub const HOST_PROTOCOL_VERSION: &str = "23";
+pub const HOST_PROTOCOL_VERSION: &str = "24";
 pub const HOST_STORAGE_SCHEMA_VERSION: i64 = 24;
 pub const HOST_MINIMUM_CLI_VERSION: &str = "0.1.10";
 
@@ -160,6 +160,17 @@ pub enum CodexUpdateAvailability {
     UnsupportedHostPlatform,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativePrerequisiteStatus {
+    NotObserved,
+    Validated,
+    Missing,
+    Untrusted,
+    NotReady,
+    Unavailable,
+}
+
 /// Typed Host evidence used to plan Codex-owned updates. Raw probe output does
 /// not cross this boundary.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -170,6 +181,8 @@ pub struct CodexUpdateEvidence {
     pub native_component_ownership: CodexComponentOwnership,
     pub runtime_current_version: Option<String>,
     pub native_component_current_version: Option<String>,
+    pub native_prerequisites: NativePrerequisiteStatus,
+    /// Supported runtime floor, not a selected replacement release.
     pub required_version: String,
     pub runtime_update_required: bool,
     pub native_update_required: bool,
@@ -214,7 +227,8 @@ pub struct HostUpdateMutation {
 pub struct HostUpdateTargetPlan {
     pub target: HostUpdateTarget,
     pub current_version: Option<String>,
-    pub target_version: String,
+    /// The selected release, absent when maintenance has not selected one.
+    pub target_version: Option<String>,
     pub version_source: HostUpdateVersionSource,
     pub artifact_digest: Option<String>,
     pub disposition: HostUpdateDisposition,
@@ -478,7 +492,8 @@ pub struct RepairUpgradeAction {
     pub action_id: String,
     pub target: HostUpdateTarget,
     pub current_version: Option<String>,
-    pub target_version: String,
+    /// The selected release, absent when maintenance has not selected one.
+    pub target_version: Option<String>,
     pub compatibility_reason: Option<RepairCompatibilityReason>,
     pub version_source: HostUpdateVersionSource,
     pub disposition: RepairUpgradeDisposition,
@@ -627,6 +642,7 @@ mod tests {
             "native_component_ownership": "codex_owned",
             "runtime_current_version": "1.0.0",
             "native_component_current_version": "1.0.0",
+            "native_prerequisites": "not_observed",
             "required_version": "1.0.0",
             "runtime_update_required": false,
             "native_update_required": false,
@@ -645,6 +661,7 @@ mod tests {
             "native_component_ownership": "codex_owned",
             "runtime_current_version": null,
             "native_component_current_version": null,
+            "native_prerequisites": "not_observed",
             "required_version": "1.0.0",
             "runtime_update_required": false,
             "native_update_required": false,
@@ -679,7 +696,7 @@ mod tests {
         HostUpdateTargetPlan {
             target,
             current_version: Some("1.0.0".to_string()),
-            target_version: "1.1.0".to_string(),
+            target_version: Some("1.1.0".to_string()),
             version_source: HostUpdateVersionSource::InvokingCliRelease,
             artifact_digest: None,
             disposition: HostUpdateDisposition::Update,
@@ -723,7 +740,7 @@ mod tests {
             action_id: "repair-host-daemon".to_string(),
             target: HostUpdateTarget::HostDaemon,
             current_version: Some("1.0.0".to_string()),
-            target_version: "1.1.0".to_string(),
+            target_version: Some("1.1.0".to_string()),
             compatibility_reason: Some(RepairCompatibilityReason::BelowMinimumVersion),
             version_source: HostUpdateVersionSource::HostCompatibilityRequirement,
             disposition: RepairUpgradeDisposition::Required,
@@ -777,7 +794,7 @@ mod tests {
                     action_id: "repair-host-daemon".to_string(),
                     target: HostUpdateTarget::HostDaemon,
                     current_version: None,
-                    target_version: "1.1.0".to_string(),
+                    target_version: Some("1.1.0".to_string()),
                     compatibility_reason: Some(RepairCompatibilityReason::Missing),
                     version_source: HostUpdateVersionSource::InvokingCliRelease,
                     disposition: RepairUpgradeDisposition::Required,
@@ -786,7 +803,7 @@ mod tests {
                     action_id: "repair-codex-runtime".to_string(),
                     target: HostUpdateTarget::CodexRuntime,
                     current_version: None,
-                    target_version: "1.1.0".to_string(),
+                    target_version: Some("1.1.0".to_string()),
                     compatibility_reason: Some(RepairCompatibilityReason::Missing),
                     version_source: HostUpdateVersionSource::CodexCompatibilityRequirement,
                     disposition: RepairUpgradeDisposition::ManualActionRequired,
@@ -825,7 +842,7 @@ mod tests {
         let current = HostUpdateTargetPlan {
             target: HostUpdateTarget::HostDaemon,
             current_version: Some("1.1.0".to_string()),
-            target_version: "1.1.0".to_string(),
+            target_version: Some("1.1.0".to_string()),
             version_source: HostUpdateVersionSource::InvokingCliRelease,
             artifact_digest: None,
             disposition: HostUpdateDisposition::Current,
@@ -848,7 +865,7 @@ mod tests {
                     action_id: "repair-host-daemon".to_string(),
                     target: HostUpdateTarget::HostDaemon,
                     current_version: None,
-                    target_version: "1.1.0".to_string(),
+                    target_version: Some("1.1.0".to_string()),
                     compatibility_reason: Some(RepairCompatibilityReason::Missing),
                     version_source: HostUpdateVersionSource::InvokingCliRelease,
                     disposition: RepairUpgradeDisposition::Required,
@@ -857,7 +874,7 @@ mod tests {
                     action_id: "repair-codex-runtime".to_string(),
                     target: HostUpdateTarget::CodexRuntime,
                     current_version: None,
-                    target_version: "1.1.0".to_string(),
+                    target_version: Some("1.1.0".to_string()),
                     compatibility_reason: Some(RepairCompatibilityReason::Missing),
                     version_source: HostUpdateVersionSource::CodexCompatibilityRequirement,
                     disposition: RepairUpgradeDisposition::Required,

@@ -821,6 +821,8 @@ impl HostService {
                         crate::core::host_update::CodexComponentOwnership::CodexOwned,
                     runtime_current_version: None,
                     native_component_current_version: None,
+                    native_prerequisites:
+                        crate::core::host_update::NativePrerequisiteStatus::NotReady,
                     required_version: crate::host::codex_capabilities::MINIMUM_CODEX_VERSION
                         .to_string(),
                     runtime_update_required: true,
@@ -860,6 +862,7 @@ impl HostService {
             .execute_exclusive(|| match &self.mode {
                 HostMode::Production { .. } => Ok(production_codex_update_evidence(
                     &ProductionCapabilitySnapshot::collect(None),
+                    crate::host::codex_capabilities::observe_native_computer_use_prerequisites,
                 )),
                 #[cfg(any(test, feature = "test-support"))]
                 HostMode::TestFake { .. } => Ok(self
@@ -2326,13 +2329,17 @@ fn production_capabilities(
         native_action_relay: false,
         provider_computer_use: false,
         image_attachments: snapshot.image_attachments_supported(),
-        codex_update_evidence: production_codex_update_evidence(snapshot),
+        codex_update_evidence: production_codex_update_evidence(snapshot, || {
+            crate::core::host_update::NativePrerequisiteStatus::NotObserved
+        }),
     }
 }
 
 fn production_codex_update_evidence(
     snapshot: &ProductionCapabilitySnapshot,
+    observe_native: impl FnOnce() -> crate::core::host_update::NativePrerequisiteStatus,
 ) -> crate::core::host_update::CodexUpdateEvidence {
+    use crate::core::host_update::{NativePrerequisiteStatus, RepairCompatibilityReason};
     let runtime_current_version = match snapshot.evidence.codex_version {
         crate::host::codex_capabilities::CodexVersionEvidence::Detected { version } => {
             Some(version.to_string())
@@ -2350,37 +2357,27 @@ fn production_codex_update_evidence(
         .then(|| {
             runtime_compatibility_reason(
                 snapshot.evidence.codex_version,
-                snapshot
-                    .verdict
-                    .blockers()
-                    .iter()
-                    .map(|blocker| blocker.reason),
+                snapshot.control_plane_admission,
             )
         })
         .flatten();
-    let native_execution_path_unavailable = snapshot
-        .verdict
-        .blockers()
-        .iter()
-        .any(|blocker| blocker.reason == BlockerReason::NativeExecutionPathUnavailable);
-    let incomplete_live_proof = snapshot
-        .verdict
-        .blockers()
-        .iter()
-        .any(|blocker| blocker.reason == BlockerReason::IncompleteLiveProof);
-    let native_component_compatibility_reason = if unsupported_host_platform {
-        None
-    } else if native_execution_path_unavailable {
-        Some(crate::core::host_update::RepairCompatibilityReason::ControlPlaneIncompatible)
-    } else if incomplete_live_proof {
-        Some(crate::core::host_update::RepairCompatibilityReason::NativeReadinessBlocked)
-    } else {
-        runtime_compatibility_reason
+    // Schema discovery deliberately leaves the live acceptance journey
+    // unobserved. Only current installation validation can establish native
+    // prerequisite health. Startup callers supply NotObserved without probing.
+    let native_prerequisites =
+        if !unsupported_host_platform && runtime_compatibility_reason.is_none() {
+            observe_native()
+        } else {
+            NativePrerequisiteStatus::NotObserved
+        };
+    let native_component_compatibility_reason = match native_prerequisites {
+        NativePrerequisiteStatus::NotObserved | NativePrerequisiteStatus::Validated => None,
+        NativePrerequisiteStatus::Missing => Some(RepairCompatibilityReason::Missing),
+        NativePrerequisiteStatus::Untrusted => Some(RepairCompatibilityReason::Corrupted),
+        NativePrerequisiteStatus::NotReady | NativePrerequisiteStatus::Unavailable => {
+            Some(RepairCompatibilityReason::NativeReadinessBlocked)
+        }
     };
-    let native_component_current_version = (!native_execution_path_unavailable)
-        .then_some(runtime_current_version.clone())
-        .flatten();
-
     crate::core::host_update::CodexUpdateEvidence {
         availability: if unsupported_host_platform {
             crate::core::host_update::CodexUpdateAvailability::UnsupportedHostPlatform
@@ -2389,14 +2386,17 @@ fn production_codex_update_evidence(
         },
         runtime_ownership: crate::core::host_update::CodexComponentOwnership::CodexOwned,
         native_component_ownership: crate::core::host_update::CodexComponentOwnership::CodexOwned,
-        runtime_current_version: runtime_current_version.clone(),
-        // Codex version and native-path probes establish the Codex-owned
-        // component state. Readiness-cache state says only whether a prior
-        // smoke-test result can be reused.
-        native_component_current_version,
-        required_version: crate::host::codex_capabilities::MINIMUM_CODEX_VERSION.to_string(),
+        runtime_current_version,
+        // A Codex CLI version does not identify the separately signed native
+        // SDK. Installation validation does not select a replacement version.
+        native_component_current_version: None,
+        native_prerequisites,
+        required_version: HostService::required_codex_version(),
         runtime_update_required: runtime_compatibility_reason.is_some(),
-        native_update_required: native_component_compatibility_reason.is_some(),
+        native_update_required: matches!(
+            native_prerequisites,
+            NativePrerequisiteStatus::Missing | NativePrerequisiteStatus::Untrusted
+        ),
         runtime_compatibility_reason,
         native_component_compatibility_reason,
     }
@@ -2416,33 +2416,24 @@ fn production_codex_runtime(snapshot: &ProductionCapabilitySnapshot) -> bool {
 
 fn runtime_compatibility_reason(
     codex_version: crate::host::codex_capabilities::CodexVersionEvidence,
-    blocker_reasons: impl Iterator<Item = BlockerReason>,
+    admission: crate::host::codex_capabilities::ControlPlaneAdmission,
 ) -> Option<crate::core::host_update::RepairCompatibilityReason> {
+    use crate::core::ControlPlaneOperation;
     use crate::core::host_update::RepairCompatibilityReason;
-    use crate::host::codex_capabilities::CodexVersionEvidence;
-
+    use crate::host::codex_capabilities::{CodexVersionEvidence, MINIMUM_CODEX_VERSION};
     match codex_version {
-        CodexVersionEvidence::Detected { .. } => {
-            let mut unsupported = false;
-            let mut control_plane_incompatible = false;
-            for reason in blocker_reasons {
-                unsupported |= matches!(
-                    reason,
-                    BlockerReason::MalformedCodexVersion
-                        | BlockerReason::CodexVersionUnavailable
-                        | BlockerReason::UnsupportedCodexVersion
-                );
-                control_plane_incompatible |= reason == BlockerReason::NonStableSurface;
-            }
-
-            if unsupported {
-                Some(RepairCompatibilityReason::Unsupported)
-            } else if control_plane_incompatible {
-                Some(RepairCompatibilityReason::ControlPlaneIncompatible)
-            } else {
-                None
-            }
+        CodexVersionEvidence::Detected { version } if version < MINIMUM_CODEX_VERSION => {
+            Some(RepairCompatibilityReason::Unsupported)
         }
+        CodexVersionEvidence::Detected { .. } => [
+            ControlPlaneOperation::Run,
+            ControlPlaneOperation::Steer,
+            ControlPlaneOperation::Stop,
+            ControlPlaneOperation::Status,
+        ]
+        .into_iter()
+        .any(|operation| admission.admit(operation).is_err())
+        .then_some(RepairCompatibilityReason::ControlPlaneIncompatible),
         CodexVersionEvidence::Missing => Some(RepairCompatibilityReason::Missing),
         CodexVersionEvidence::Malformed => Some(RepairCompatibilityReason::Corrupted),
         CodexVersionEvidence::Unavailable => Some(RepairCompatibilityReason::Unsupported),
@@ -2764,59 +2755,89 @@ mod tests {
         );
     }
 
-    #[test]
-    fn detected_codex_with_an_unstable_surface_requires_control_plane_repair() {
-        assert_eq!(
-            runtime_compatibility_reason(
-                crate::host::codex_capabilities::CodexVersionEvidence::Detected {
-                    version: crate::host::codex_capabilities::MINIMUM_CODEX_VERSION,
-                },
-                [BlockerReason::NonStableSurface].into_iter(),
-            ),
-            Some(crate::core::host_update::RepairCompatibilityReason::ControlPlaneIncompatible)
-        );
+    fn maintenance_fixture_snapshot(
+        schema: &'static str,
+        handshake: &'static str,
+    ) -> ProductionCapabilitySnapshot {
+        let (evidence, control_plane_admission) =
+            crate::host::codex_capabilities::control_plane_tests::maintenance_control_plane_fixture(
+                schema, handshake,
+            );
+        ProductionCapabilitySnapshot {
+            verdict: crate::host::evaluate_phase0_support(evidence),
+            evidence,
+            control_plane_admission,
+            budget_failure: None,
+            started_at: "2026-10-24T00:00:00Z".to_string(),
+            finished_at: "2026-10-24T00:00:00Z".to_string(),
+            duration_ms: 0,
+        }
     }
 
     #[test]
-    fn newer_runtime_with_incomplete_live_proof_requires_only_native_readiness_repair() {
-        use crate::host::codex_capabilities::{
-            CapabilityMatrix, CodexVersionEvidence, ControlPlaneAdmission, EvidenceSurface,
-            HostPlatform, LiveProofStatus, Phase0CapabilityBlocker, Phase0CapabilityEvidence,
-            Phase0SupportVerdict, RequiredCapability,
-        };
-
-        let mut snapshot = ProductionCapabilitySnapshot::collect(None);
-        let newer_version = crate::host::codex_capabilities::CodexVersion::new(0, 147, 0);
-        snapshot.evidence = Phase0CapabilityEvidence {
-            codex_version: CodexVersionEvidence::Detected {
-                version: newer_version,
-            },
-            host_platform: HostPlatform::Windows,
-            capabilities: CapabilityMatrix::unproven(),
-        };
-        snapshot.verdict = Phase0SupportVerdict::Blocked {
-            blockers: vec![Phase0CapabilityBlocker {
-                reason: BlockerReason::IncompleteLiveProof,
-                capability: RequiredCapability::NativeReadiness,
-                codex_version: CodexVersionEvidence::Detected {
-                    version: newer_version,
-                },
-                host_platform: HostPlatform::Windows,
-                observed_surface: EvidenceSurface::Stable,
-                live_proof: LiveProofStatus::NotObserved,
-            }],
-        };
-        snapshot.control_plane_admission = ControlPlaneAdmission::not_applicable();
-
-        let evidence = production_codex_update_evidence(&snapshot);
-
-        assert!(!evidence.runtime_update_required);
-        assert_eq!(evidence.runtime_compatibility_reason, None);
-        assert!(evidence.native_update_required);
-        assert_eq!(
-            evidence.native_component_compatibility_reason,
-            Some(crate::core::host_update::RepairCompatibilityReason::NativeReadinessBlocked)
+    fn maintenance_does_not_replace_a_newer_runtime_for_unobserved_live_proof() {
+        use crate::core::host_update::{NativePrerequisiteStatus, RepairCompatibilityReason};
+        let snapshot = maintenance_fixture_snapshot("required", "success");
+        // Retain the real aggregate verdict which triggered the old bug.
+        assert!(
+            snapshot
+                .verdict
+                .blockers()
+                .iter()
+                .any(|b| b.reason == BlockerReason::NonStableSurface)
         );
+        for (status, replacement, reason) in [
+            (NativePrerequisiteStatus::Validated, false, None),
+            (NativePrerequisiteStatus::NotObserved, false, None),
+            (
+                NativePrerequisiteStatus::Missing,
+                true,
+                Some(RepairCompatibilityReason::Missing),
+            ),
+            (
+                NativePrerequisiteStatus::Untrusted,
+                true,
+                Some(RepairCompatibilityReason::Corrupted),
+            ),
+            (
+                NativePrerequisiteStatus::NotReady,
+                false,
+                Some(RepairCompatibilityReason::NativeReadinessBlocked),
+            ),
+            (
+                NativePrerequisiteStatus::Unavailable,
+                false,
+                Some(RepairCompatibilityReason::NativeReadinessBlocked),
+            ),
+        ] {
+            let evidence = production_codex_update_evidence(&snapshot, || status);
+            assert_eq!(evidence.runtime_current_version.as_deref(), Some("0.164.0"));
+            assert!(!evidence.runtime_update_required);
+            assert_eq!(evidence.runtime_compatibility_reason, None);
+            assert_eq!(evidence.native_prerequisites, status);
+            assert_eq!(evidence.native_update_required, replacement);
+            assert_eq!(evidence.native_component_compatibility_reason, reason);
+            assert_eq!(evidence.native_component_current_version, None);
+        }
+    }
+
+    #[test]
+    fn maintenance_preserves_real_missing_method_and_handshake_failures() {
+        use crate::core::host_update::RepairCompatibilityReason;
+        for (schema, handshake) in [
+            ("missing-steering", "success"),
+            ("required", "hang-with-descendant"),
+        ] {
+            let snapshot = maintenance_fixture_snapshot(schema, handshake);
+            let evidence = production_codex_update_evidence(&snapshot, || {
+                panic!("incompatible control plane cannot admit native inventory")
+            });
+            assert!(evidence.runtime_update_required);
+            assert_eq!(
+                evidence.runtime_compatibility_reason,
+                Some(RepairCompatibilityReason::ControlPlaneIncompatible)
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]

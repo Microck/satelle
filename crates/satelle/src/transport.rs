@@ -5010,9 +5010,7 @@ fn plan_host_update_internal(
         Some(codex_evidence) => {
             crate::host_update::codex_inspections_from_evidence(&codex_evidence)
         }
-        None => {
-            crate::host_update::unavailable_codex_inspections(&HostService::required_codex_version())
-        }
+        None => crate::host_update::unavailable_codex_inspections(),
     };
     let mut report = crate::host_update::build_host_update_plan(
         crate::host_update::HostUpdatePlanRequest {
@@ -6081,8 +6079,11 @@ fn host_update_recovery_identity(
     let artifact_digest = target.artifact_digest.as_deref().ok_or_else(|| {
         SatelleError::invalid_usage("the Host update plan lacks a verified artifact digest")
     })?;
+    let target_version = target.target_version.as_deref().ok_or_else(|| {
+        SatelleError::invalid_usage("the Host update plan lacks a selected release version")
+    })?;
     Ok(satelle::core::host_update::HostUpdateRecoveryIdentity::new(
-        &target.target_version,
+        target_version,
         artifact_digest,
     ))
 }
@@ -6712,7 +6713,7 @@ pub(crate) fn plan_repair_upgrades(
     let mut repair_inspections = vec![crate::host_update::RepairUpgradeInspection {
         target: HostUpdateTarget::HostDaemon,
         current_version: inspection.current_version.clone(),
-        target_version: host_target_version,
+        target_version: Some(host_target_version),
         compatibility_reason: host_reason,
         version_source: host_version_source,
         automation_is_safe: inspection.host_automation_is_safe
@@ -6816,7 +6817,7 @@ fn append_codex_repair_inspections(
         repair_inspections.push(crate::host_update::RepairUpgradeInspection {
             target,
             current_version,
-            target_version: codex.required_version.clone(),
+            target_version: None,
             compatibility_reason,
             version_source: HostUpdateVersionSource::CodexCompatibilityRequirement,
             // No current transport owns an automatic Codex replacement executor.

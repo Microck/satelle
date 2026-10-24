@@ -169,7 +169,7 @@ watch or notify workflow remains the recorded operation.
 - Cancellation, expiry, admission, validation failure, and startup recovery
   remove private payloads. Position changes and terminal outcomes use durable
   state revisions, normalized logs, and the closed queue event set.
-- `queue status` and `queue cancel` use the public `rq_` identity. Protocol v23
+- `queue status` and `queue cancel` use the public `rq_` identity. Protocol v24
   and `satelle.api.v12` carry queue opt-in and the strict status and cancellation
   response contracts.
 
@@ -194,7 +194,7 @@ watch or notify workflow remains the recorded operation.
 - The native adapter accepts the daemon account's own OS user. A different OS
   user fails with `desktop-binding-secure-handoff-unsupported` until the target
   platform and native runtime provide a secure handoff.
-- Protocol version 23 and `satelle.api.v12` require the selected binding on Turn
+- Protocol version 24 and `satelle.api.v12` require the selected binding on Turn
   requests. `satelle.session.v2`, `satelle.logs.entry.v2`, and
   `satelle.api-token.issue.v2` expose the new binding contracts without an old
   request fallback.
@@ -227,7 +227,7 @@ npm checks, and the production documentation build.
 - Attached output reports the manifest path, every artifact path, expiry, and
   cleanup command. Remote Controllers retrieve the completed manifest through
   the authenticated `diagnostics:sensitive` contract after terminal status.
-  Protocol v23 and `satelle.api.v12` define this recording request boundary.
+  Protocol v24 and `satelle.api.v12` define this recording request boundary.
 
 ## Raw protocol diagnostic decisions
 
@@ -472,7 +472,7 @@ plus documentation and release installation checks on all six targets.
 - Paths use absolute native Host syntax. The Controller neither interprets nor
   opens them. The Host applies bounded regular-file reads before admission.
 - Uploads and Host paths share the current tagged attachment list in
-  `satelle.api.v12` and protocol version 23. No older request shape is accepted.
+  `satelle.api.v12` and protocol version 24. No older request shape is accepted.
 - The keyed operation identity includes the path reference. A replay or
   cancellation resolves from durable admission state without reopening files.
 - Remote files share the upload limits and private staging lifecycle. Cleanup
