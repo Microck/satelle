@@ -2195,6 +2195,7 @@
 - satelle treats cross-platform host support as successful configuration, diagnostics, and capability reporting, not as a guarantee that native Codex Computer Use is available on every operating system @mvp @implemented
 - satelle Computer Use readiness checks verify standalone Codex installation, authentication, native Computer Use availability, required OS permissions, app-server or remote-control startup, and a harmless observable Computer Use action @spec @mvp @implemented
 - satelle Computer Use readiness checks return structured pass/fail reasons for each checked prerequisite @spec @mvp @implemented
+- macOS native readiness derives drag coordinates in screenshot pixels from the owned page's current control bounds, device pixel ratio, and a trusted indexed click; it never assumes a fixed Safari window size or browser toolbar offset @spec @mvp @implemented
 - satelle treats configured model and provider values as requested intent rather than proof that the provider supports native Computer Use @mvp @implemented
 - satelle proves selected model-provider Computer Use compatibility with a host-side provider smoke test before prompt execution @mvp @implemented
 - satelle provider smoke tests run through the same remote Codex control plane and native Computer Use path that prompt execution will use @mvp @implemented
