@@ -922,7 +922,7 @@ fn write_page(
         #[cfg(test)]
         ProbeRequirements::DragOnly => String::new(),
         ProbeRequirements::ClickAndDrag => format!(
-            "<button id=confirm type=button>Click to confirm</button><script>document.querySelector('#confirm').addEventListener('click',event=>{{if(!event.isTrusted)return;event.currentTarget.textContent='Click event observed';fetch('{completion_target}',{{method:'POST',headers:{{'Content-Type':'{FORM_CONTENT_TYPE}'}},credentials:'omit',cache:'no-store',keepalive:true,body:'nonce={nonce}&action=click'}});}});</script>"
+            "<button id=confirm type=button>Click to confirm</button><script>document.querySelector('#confirm').addEventListener('click',event=>{{if(!event.isTrusted)return;calibrateDrag(event);event.currentTarget.textContent='Click event observed';fetch('{completion_target}',{{method:'POST',headers:{{'Content-Type':'{FORM_CONTENT_TYPE}'}},credentials:'omit',cache:'no-store',keepalive:true,body:'nonce={nonce}&action=click'}});}});</script>"
         ),
     };
     let title = match requirements {
@@ -930,12 +930,13 @@ fn write_page(
         ProbeRequirements::DragOnly => "Satelle provider probe",
         ProbeRequirements::ClickAndDrag => "Satelle native readiness probe",
     };
-    // The macOS Window API drags at app-window coordinates. A range control
-    // turns real pointer travel into a trusted, observable value change. This
-    // avoids HTML drag-and-drop semantics, which Safari may not emit for the
-    // Computer Use service's synthesized mouse gesture.
+    // Sky uses screenshot pixels, while browser layout uses CSS pixels. The
+    // trusted indexed click supplies the actual viewport offset inside this
+    // window. Together with its current pixel ratio and control bounds, it
+    // locates the explicitly sized thumb without guessing Safari's chrome.
+    // A range value change still independently proves the native drag.
     let body = format!(
-        "<!doctype html><meta charset=utf-8><meta name=referrer content=no-referrer><link rel=icon href=data:,><title>{title}</title><style>main{{font:24px sans-serif;padding:40px}}button{{display:block;box-sizing:border-box;width:320px;min-height:80px;margin:24px 0;padding:24px;border:3px solid #222;background:#fff;color:#111;text-align:center}}#source{{position:fixed;left:48px;top:228px;width:740px;height:80px;margin:0;cursor:grab}}#target{{position:fixed;left:48px;top:332px}}</style><main><p>Nonce: <strong>{nonce}</strong></p>{click_control}<label id=target for=source>Drag the control</label><input id=source type=range min=0 max=100 value=0></main><script>const source=document.querySelector('#source');const target=document.querySelector('#target');let dragSent=false;const completeDrag=event=>{{if(!event.isTrusted||Number(event.currentTarget.value)<50||dragSent)return;dragSent=true;target.textContent='Drag event observed';fetch('{completion_target}',{{method:'POST',headers:{{'Content-Type':'{FORM_CONTENT_TYPE}'}},credentials:'omit',cache:'no-store',keepalive:true,body:'nonce={nonce}&action=drag'}});}};source.addEventListener('input',completeDrag);</script>"
+        "<!doctype html><meta charset=utf-8><meta name=referrer content=no-referrer><link rel=icon href=data:,><title>{title}</title><style>main{{font:24px sans-serif;padding:40px}}button{{display:block;box-sizing:border-box;width:320px;min-height:80px;margin:24px 0;padding:24px;border:3px solid #222;background:#fff;color:#111;text-align:center}}#source{{position:fixed;left:48px;top:228px;width:740px;height:80px;margin:0;cursor:grab;--thumb-width:16px;appearance:none;background:#ddd}}#source::-webkit-slider-thumb{{appearance:none;width:var(--thumb-width);height:80px;background:#222}}#target{{position:fixed;left:48px;top:332px}}</style><main><p>Nonce: <strong>{nonce}</strong></p>{click_control}<label id=target for=source>Drag the control</label><input id=source type=range min=0 max=100 value=0></main><script>const source=document.querySelector('#source');const target=document.querySelector('#target');function calibrateDrag(event){{const rect=source.getBoundingClientRect(),thumb=Number.parseFloat(getComputedStyle(source).getPropertyValue('--thumb-width')),x=event.screenX-window.screenX-event.clientX,y=event.screenY-window.screenY-event.clientY,px=value=>Math.round(value*window.devicePixelRatio);target.textContent='Native drag coordinates: '+[x+rect.left+thumb/2,y+rect.top+rect.height/2,x+rect.right-thumb/2,y+rect.top+rect.height/2].map(px).join(',');}}let dragSent=false;const completeDrag=event=>{{if(!event.isTrusted||Number(event.currentTarget.value)<50||dragSent)return;dragSent=true;target.textContent='Drag event observed';fetch('{completion_target}',{{method:'POST',headers:{{'Content-Type':'{FORM_CONTENT_TYPE}'}},credentials:'omit',cache:'no-store',keepalive:true,body:'nonce={nonce}&action=drag'}});}};source.addEventListener('input',completeDrag);</script>"
     );
     write_response(stream, "200 OK", "text/html; charset=utf-8", &body)
 }
@@ -1189,6 +1190,11 @@ mod tests {
         assert!(page.contains("Number(event.currentTarget.value)<50"));
         assert!(page.contains("Click event observed"));
         assert!(page.contains("Drag event observed"));
+        assert!(page.contains("calibrateDrag(event)"));
+        assert!(page.contains("event.screenX-window.screenX-event.clientX"));
+        assert!(page.contains("event.screenY-window.screenY-event.clientY"));
+        assert!(page.contains("value*window.devicePixelRatio"));
+        assert!(page.contains("Native drag coordinates: "));
         assert_eq!(page.matches("keepalive:true").count(), 2);
         assert!(page.contains("if(!event.isTrusted)return"));
 
