@@ -1,6 +1,6 @@
 core:changelogs:
-  - content: "---\npackages:\n  cargo:satelle:\n    type: patch\n---\n\n## Interrupted macOS setup\n\nRecover an interrupted native prerequisite check with `satelle host recover-bootstrap`. Recovery validates the installed signed components, reconciles the exact abandoned operation and preserves its claim with a durable receipt. The old setup remains a partial failure; run normal setup again afterward.\n\n## Failed macOS prerequisite checks\n\nRelease setup ownership normally when a macOS prerequisite check fails without changing the host. Missing or untrusted components still fail validation.\n\n## Repair planning\n\nLet activated setup credentials read the update evidence needed to plan persistent Host service repairs and updates. Ordinary read and control credentials retain their existing limits, and storage cleanup still requires admin scope.\n"
-    filename: macos-setup-recovery.md
+  - content: "---\npackages:\n  cargo:satelle:\n    type: patch\n---\n\n## macOS native readiness\n\nCalibrate the readiness probe's drag from current window geometry and pixel ratio instead of fixed coordinates. Trusted input, authenticated completion callbacks and exact native-tool evidence remain required.\n\n## Accurate repair evidence\n\nKeep unperformed live checks separate from installation compatibility. Validate current signed native prerequisites, distinguish missing or untrusted components from failed observations, and stop displaying the minimum supported Codex version as a replacement target. Unselected replacement versions and unobserved native SDK versions remain unset. Maintenance reads reserve every bounded producer phase.\n\n## Controller and Host upgrade\n\nUpdate the controller and Host together. Protocol 24 adds explicit native prerequisite status and nullable replacement targets. Older peers receive a protocol incompatibility diagnostic before evidence decoding.\n"
+    filename: native-readiness-and-repair.md
     v: 0.0.0
 core:packages:
   - id: npm:satelle-repository
@@ -8,7 +8,7 @@ core:packages:
   - id: npm:satelle-docs
     updated: false
   - changelogIds:
-      - macos-setup-recovery.md
+      - native-readiness-and-repair.md
     id: cargo:satelle
     updated: true
 npm:packages:
