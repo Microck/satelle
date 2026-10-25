@@ -1,3 +1,9 @@
+## satelle@0.1.45
+
+### Native readiness
+
+Present the native readiness call as a balanced JavaScript block. On macOS, explain that its temporary local test page and separate Safari window belong to the authorized readiness check. This helps Luna complete preflight without altering the native script, app permissions or independent click-and-drag verification.
+
 ## satelle@0.1.44
 
 ### macOS native readiness
