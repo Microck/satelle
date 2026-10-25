@@ -1298,7 +1298,7 @@ test("native release archives use canonical names and match native npm executabl
   assert.deepEqual(JSON.parse(compatibilityBytes), {
     schema_version: 1,
     version: workspaceVersion(),
-    protocol_version: "23",
+    protocol_version: "24",
     storage_schema_version: 24,
     minimum_cli_version: "0.1.10",
   });

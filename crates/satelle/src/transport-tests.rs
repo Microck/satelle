@@ -404,7 +404,7 @@ fn unavailable_daemon_repairs_enter_host_replacement_under_bootstrap_lock() {
                 target: HostUpdateTarget::HostDaemon,
                 current_version: (compatibility_reason != RepairCompatibilityReason::Missing)
                     .then(|| "0.1.0".to_string()),
-                target_version: env!("CARGO_PKG_VERSION").to_string(),
+                target_version: Some(env!("CARGO_PKG_VERSION").to_string()),
                 compatibility_reason: Some(compatibility_reason),
                 version_source: HostUpdateVersionSource::InvokingCliRelease,
                 disposition: RepairUpgradeDisposition::Required,
@@ -592,7 +592,7 @@ fn test_host_update_report() -> satelle::core::host_update::HostUpdateReport {
         vec![satelle::core::host_update::HostUpdateTargetPlan {
             target: satelle::core::host_update::HostUpdateTarget::HostDaemon,
             current_version: Some("0.0.9".to_string()),
-            target_version: env!("CARGO_PKG_VERSION").to_string(),
+            target_version: Some(env!("CARGO_PKG_VERSION").to_string()),
             version_source: satelle::core::host_update::HostUpdateVersionSource::InvokingCliRelease,
             artifact_digest: Some(
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
@@ -686,7 +686,7 @@ fn missing_codex_evidence_does_not_block_host_repair_planning() {
     let mut inspections = vec![crate::host_update::RepairUpgradeInspection {
         target: HostUpdateTarget::HostDaemon,
         current_version: None,
-        target_version: "1.0.0".to_string(),
+        target_version: Some("1.0.0".to_string()),
         compatibility_reason: Some(RepairCompatibilityReason::Missing),
         version_source: HostUpdateVersionSource::InvokingCliRelease,
         automation_is_safe: true,
@@ -698,6 +698,49 @@ fn missing_codex_evidence_does_not_block_host_repair_planning() {
 
     assert_eq!(inspections.len(), 1);
     assert_eq!(inspections[0].target, HostUpdateTarget::HostDaemon);
+}
+
+#[test]
+fn repair_does_not_promote_the_codex_floor_to_a_replacement_release() {
+    use satelle::core::host_update::{CodexUpdateEvidence, NativePrerequisiteStatus};
+    let evidence = CodexUpdateEvidence {
+        availability: satelle::core::host_update::CodexUpdateAvailability::Available,
+        runtime_ownership: satelle::core::host_update::CodexComponentOwnership::CodexOwned,
+        native_component_ownership: satelle::core::host_update::CodexComponentOwnership::CodexOwned,
+        runtime_current_version: Some("0.164.0".to_string()),
+        native_component_current_version: None,
+        native_prerequisites: NativePrerequisiteStatus::Validated,
+        required_version: "0.144.0".to_string(),
+        runtime_update_required: false,
+        native_update_required: false,
+        runtime_compatibility_reason: None,
+        native_component_compatibility_reason: None,
+    };
+    let mut inspections = Vec::new();
+    append_codex_repair_inspections(&mut inspections, Some(evidence)).unwrap();
+    let report = crate::host_update::build_repair_upgrade_plan("office", &inspections);
+    assert_eq!(
+        report.status,
+        satelle::core::host_update::RepairStatus::UpToDate
+    );
+    assert_eq!(report.actions.len(), 2);
+    assert!(
+        report
+            .actions
+            .iter()
+            .all(|action| action.target_version.is_none())
+    );
+    assert_eq!(
+        report.actions[0].current_version.as_deref(),
+        Some("0.164.0")
+    );
+}
+
+#[test]
+fn host_update_recovery_requires_a_selected_release() {
+    let mut report = test_host_update_report();
+    report.targets[0].target_version = None;
+    assert!(host_update_recovery_identity(&report).is_err());
 }
 
 #[derive(Clone)]

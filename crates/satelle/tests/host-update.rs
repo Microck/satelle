@@ -248,7 +248,7 @@ fn current_host_update_exits_without_confirmation_or_mutation() {
 }
 
 #[test]
-fn default_current_host_update_reports_skipped_targets_in_human_output() {
+fn default_current_host_update_reports_codex_observation_in_human_output() {
     let state = TestStateDir::new().expect("create secure temporary state directory");
     let output = satelle()
         .env("SATELLE_STATE_DIR", state.path())
@@ -269,7 +269,11 @@ fn default_current_host_update_reports_skipped_targets_in_human_output() {
     let stdout = String::from_utf8(output.stdout).expect("Host update output is UTF-8");
     assert!(stdout.contains("Host update plan for local-demo"));
     assert!(stdout.contains("- CodexRuntime: unavailable"));
-    assert!(stdout.contains("- CodexNativeComputerUse: unavailable"));
+    if cfg!(any(target_os = "windows", target_os = "macos")) {
+        assert!(stdout.contains("- CodexNativeComputerUse: version not observed -> not selected"));
+    } else {
+        assert!(stdout.contains("- CodexNativeComputerUse: unavailable"));
+    }
     assert!(!stdout.contains("Host update status for local-demo: up to date"));
 }
 
@@ -341,7 +345,13 @@ fn repair_dry_run_uses_live_typed_upgrade_evidence() {
     assert!(actions.iter().all(|action| {
         action["target"].is_string()
             && (action["current_version"].is_string() || action["current_version"].is_null())
-            && action["target_version"].is_string()
+            && match action["target"].as_str() {
+                Some("host_daemon" | "host_daemon_service") => action["target_version"].is_string(),
+                Some("codex_runtime" | "codex_native_computer_use") => {
+                    action["target_version"].is_null()
+                }
+                _ => false,
+            }
             && action["version_source"].is_string()
             && action["disposition"].is_string()
     }));

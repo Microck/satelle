@@ -7,6 +7,7 @@ pub use app_approval::{
     NativeApprovalAuthority, NativeApprovalDecision, NativeApprovalRequest, NativeApprovalSubject,
 };
 mod codex_capabilities;
+pub(crate) use codex_capabilities::MAINTENANCE_EVIDENCE_REQUEST_TIMEOUT;
 #[path = "codex-install.rs"]
 mod codex_install;
 #[path = "codex-session.rs"]

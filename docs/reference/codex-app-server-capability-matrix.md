@@ -103,7 +103,7 @@ Tool-code decisions cannot use Always allow. Host-owned readiness still
 requires its exact script and app authority. Native turns require successful
 correlated tool completion even when the saved app grant set is empty.
 
-Protocol 23 uses `satelle.native-approvals.v1` with a tagged `subject`:
+Protocol 24 uses `satelle.native-approvals.v1` with a tagged `subject`:
 `app` contains `app_id` and `allow_always`; `tool_code` contains the exact
 `code`. Approval responses use `satelle.native-approval-response.v1`.
 Clients and Hosts must use the same protocol; the old app-only shape is rejected.

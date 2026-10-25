@@ -836,6 +836,45 @@ fn inventory_probe_is_bounded_and_terminates_descendants() {
     assert_eq!(error.details["reason"], json!("inventory_unavailable"));
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn signature_stderr_uses_the_bounded_process_reader() {
+    use super::control_plane::{CommandOutputStream, bounded_command_output_from};
+    let fixture = compile_stdio_fixture();
+    let mut command = Command::new("/bin/sh");
+    command
+        .args(["-c", "exec \"$1\" inventory-large >&2", "stderr-fixture"])
+        .arg(fixture.executable());
+    let output = bounded_command_output_from(
+        command,
+        Instant::now() + Duration::from_secs(2),
+        "native_signature_unavailable",
+        "native_bridge_untrusted",
+        CommandOutputStream::Stderr,
+    )
+    .unwrap();
+    assert_eq!(output.len(), 128 * 1024);
+    let mut hanging = Command::new("/bin/sh");
+    hanging
+        .args([
+            "-c",
+            "exec \"$1\" hang-with-descendant >&2",
+            "stderr-fixture",
+        ])
+        .arg(fixture.executable());
+    let started = Instant::now();
+    let error = bounded_command_output_from(
+        hanging,
+        started + Duration::from_millis(250),
+        "native_signature_unavailable",
+        "native_bridge_untrusted",
+        CommandOutputStream::Stderr,
+    )
+    .unwrap_err();
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert_eq!(error.details["reason"], "native_signature_unavailable");
+}
+
 #[cfg(windows)]
 #[test]
 fn mutation_probe_is_bounded_and_returns_synchronous_cli_output() {
@@ -1694,7 +1733,72 @@ fn isolation_rejects_malformed_or_redirected_computer_use_plugins() {
         .expect_err("untrusted plugin provenance must fail closed");
 
         assert_eq!(error.details["reason"], json!(expected_reason));
+        if expected_reason == "computer_use_plugin_source_untrusted" {
+            assert_eq!(
+                super::control_plane::native_prerequisite_failure_status(&error),
+                crate::core::host_update::NativePrerequisiteStatus::Untrusted,
+            );
+        }
     }
+}
+
+#[test]
+fn maintenance_distinguishes_missing_bridge_roots_from_failed_observation() {
+    use super::control_plane::{native_prerequisite_failure_status, validate_native_bridge_root};
+    use crate::core::host_update::NativePrerequisiteStatus;
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().join("native-runtime");
+    let missing = validate_native_bridge_root(&root, "windows").unwrap_err();
+    assert_eq!(
+        native_prerequisite_failure_status(&missing),
+        NativePrerequisiteStatus::Missing
+    );
+    std::fs::create_dir(&root).unwrap();
+    assert_eq!(
+        validate_native_bridge_root(&root, "windows").unwrap(),
+        std::fs::canonicalize(&root).unwrap()
+    );
+    std::fs::remove_dir(&root).unwrap();
+    std::fs::write(&root, b"not a runtime directory").unwrap();
+    let untrusted = validate_native_bridge_root(&root, "windows").unwrap_err();
+    assert_eq!(
+        native_prerequisite_failure_status(&untrusted),
+        NativePrerequisiteStatus::Untrusted
+    );
+    // A child of a file yields NotFound on Windows but NotADirectory on Unix.
+    // An embedded NUL exercises a real observation error without that OS split.
+    let unobservable =
+        validate_native_bridge_root(&fixture.path().join("invalid\0component"), "windows")
+            .unwrap_err();
+    assert_eq!(
+        native_prerequisite_failure_status(&unobservable),
+        NativePrerequisiteStatus::Unavailable
+    );
+}
+
+#[test]
+fn maintenance_preserves_native_trust_failures() {
+    use super::control_plane::native_prerequisite_failure_status;
+    use crate::core::host_update::NativePrerequisiteStatus;
+    let prerequisite_error = |reason: &str| {
+        let mut error = SatelleError::computer_use_not_ready();
+        error.details.insert("reason".to_string(), json!(reason));
+        error
+    };
+    for reason in [
+        "plugin_marketplace_untrusted",
+        "native_bridge_root_untrusted",
+    ] {
+        let error = prerequisite_error(reason);
+        assert_eq!(
+            native_prerequisite_failure_status(&error),
+            NativePrerequisiteStatus::Untrusted
+        );
+    }
+    assert_eq!(
+        native_prerequisite_failure_status(&prerequisite_error("plugin_inventory_unavailable")),
+        NativePrerequisiteStatus::Unavailable,
+    );
 }
 
 #[test]
@@ -2408,6 +2512,31 @@ fn production_stdio_deadline_survives_a_group_escaping_pipe_holder() {
         !handshake_completed,
         "an incomplete escaped-child handshake must remain blocked"
     );
+}
+
+// Exercise maintenance projection with the same real schema and stdio
+// processes used by production control-plane admission tests.
+pub(in crate::host) fn maintenance_control_plane_fixture(
+    schema_mode: &'static str,
+    app_server_mode: &'static str,
+) -> (super::Phase0CapabilityEvidence, ControlPlaneAdmission) {
+    let fixture = compile_stdio_fixture();
+    let probe = run_schema_and_stdio_fixture_with(
+        &fixture,
+        schema_mode,
+        app_server_mode,
+        Duration::from_secs(2),
+    );
+    (
+        super::Phase0CapabilityEvidence {
+            codex_version: super::CodexVersionEvidence::Detected {
+                version: super::CodexVersion::new(0, 164, 0),
+            },
+            host_platform: super::HostPlatform::Windows,
+            capabilities: super::CapabilityMatrix::from_control_plane(probe),
+        },
+        ControlPlaneAdmission::from_probe(probe),
+    )
 }
 
 fn run_fixture(mode: &'static str) -> super::control_plane::ControlPlaneProbe {
