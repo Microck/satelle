@@ -1,3 +1,17 @@
+## satelle@0.1.44
+
+### macOS native readiness
+
+Calibrate the readiness probe's drag from current window geometry and pixel ratio instead of fixed coordinates. Trusted input, authenticated completion callbacks and exact native-tool evidence remain required.
+
+### Accurate repair evidence
+
+Keep unperformed live checks separate from installation compatibility. Validate current signed native prerequisites, distinguish missing or untrusted components from failed observations, and stop displaying the minimum supported Codex version as a replacement target. Unselected replacement versions and unobserved native SDK versions remain unset. Maintenance reads reserve every bounded producer phase.
+
+### Controller and Host upgrade
+
+Update the controller and Host together. Protocol 24 adds explicit native prerequisite status and nullable replacement targets. Older peers receive a protocol incompatibility diagnostic before evidence decoding.
+
 ## satelle@0.1.43
 
 ### Interrupted macOS setup
