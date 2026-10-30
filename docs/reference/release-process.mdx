@@ -93,6 +93,11 @@ formats and archive roots, compares archive and npm executable digests, creates
 checksums, runs registry dry runs, and exercises install, upgrade, smoke, and
 uninstall paths.
 
+New commits cancel superseded release validation runs for the same pull request.
+The latest revision still runs the complete validation graph. Signed-tag releases
+and manual operations remain non-cancelling, and publication keeps its shared
+release-writer lock.
+
 ## macOS distribution
 
 Mac CLI archives and npm packages contain the same ad hoc signed executable.
