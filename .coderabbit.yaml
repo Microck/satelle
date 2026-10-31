@@ -42,7 +42,7 @@ reviews:
         add product scope. Flag changes that choose a contract without recording an
         explicit resolution, or that contradict the authoritative `.facts` file.
 
-    - path: "crates/satelle-test-contract/**"
+    - path: "crates/satelle/src/test_contract.rs"
       instructions: |
         These helpers are executable conformance evidence. Preserve independently
         typed fixtures, outcomes, reference models, and case-specific diagnostics
@@ -51,7 +51,7 @@ reviews:
         matrix dimensions, untested fields, tautological expectations, transient
         mutations hidden by final-state snapshots, and cleanup that fails on unwind.
 
-    - path: "crates/satelle-core/**"
+    - path: "crates/satelle/src/core/**"
       instructions: |
         Protect the domain invariants in `.facts`: terminal Turn states are
         immutable; Session and Turn revisions advance only with committed lifecycle
@@ -61,7 +61,7 @@ reviews:
         Require exact regression coverage for changes to state transitions, public
         serialization, identifier parsing, policy snapshots, or error semantics.
 
-    - path: "crates/satelle-host/**"
+    - path: "crates/satelle/src/host/**"
       instructions: |
         Review timeout, cancellation, process exit, transport loss, restart, and
         error paths as ownership transitions. None of them alone proves upstream
@@ -77,7 +77,7 @@ reviews:
         explicitly requires them. Flag newly introduced compatibility bridges that
         lack an explicit contract and deletion criterion.
 
-    - path: "crates/satelle-host/src/storage/**"
+    - path: "crates/satelle/src/host/{storage.rs,storage/**}"
       instructions: |
         Preserve the SQLite transaction, revision, lease, integrity, migration, and
         retention contracts. Integrity checks precede migration, migration failures
@@ -87,7 +87,7 @@ reviews:
         upstream identifiers, or unredacted fallback data. Sensitive paths must keep
         the repository's regular-file, no-symlink, ownership, and permission rules.
 
-    - path: "crates/satelle-transport/**"
+    - path: "crates/satelle/src/transport_api/**"
       instructions: |
         Treat HTTP, WebSocket, and client types as strict public contracts. Check
         authentication, authorization, Host Identity pinning, correlation, and
@@ -97,7 +97,7 @@ reviews:
         consistent across server and client paths. Public payloads must not expose
         upstream identifiers, credentials, prompts, or internal diagnostics.
 
-    - path: "crates/satelle-cli/**"
+    - path: "crates/satelle/{src/*.rs,src/command_group/**,src/completions/**,src/mcp/**,src/transport/**,tests/**}"
       instructions: |
         Preserve exact CLI and MCP boundaries: machine-readable stdout, diagnostic
         stderr, process exit class, schema_version, required fields, enum tokens,
@@ -107,7 +107,7 @@ reviews:
         or contact remote systems. Dry-run paths must not perform even transient
         filesystem, service, remote-host, credential, or desktop mutations.
 
-    - path: "crates/satelle-cli/src/mcp/**"
+    - path: "crates/satelle/src/mcp/**"
       instructions: |
         Treat AI client configuration as externally owned state. Plan from exact
         source bytes, reject intervening edits before replacement, preserve unrelated
