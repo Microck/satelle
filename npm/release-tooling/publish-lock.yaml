@@ -1,6 +1,6 @@
 core:changelogs:
-  - content: "---\npackages:\n  cargo:satelle:\n    type: patch\n---\n\n## macOS native readiness\n\nCalibrate the readiness probe's drag from current window geometry and pixel ratio instead of fixed coordinates. Trusted input, authenticated completion callbacks and exact native-tool evidence remain required.\n\n## Accurate repair evidence\n\nKeep unperformed live checks separate from installation compatibility. Validate current signed native prerequisites, distinguish missing or untrusted components from failed observations, and stop displaying the minimum supported Codex version as a replacement target. Unselected replacement versions and unobserved native SDK versions remain unset. Maintenance reads reserve every bounded producer phase.\n\n## Controller and Host upgrade\n\nUpdate the controller and Host together. Protocol 24 adds explicit native prerequisite status and nullable replacement targets. Older peers receive a protocol incompatibility diagnostic before evidence decoding.\n"
-    filename: native-readiness-and-repair.md
+  - content: "---\npackages:\n  cargo:satelle:\n    type: patch\n---\n\n## Native readiness\n\nPresent the native readiness call as a balanced JavaScript block. On macOS, explain that its temporary local test page and separate Safari window belong to the authorized readiness check. This helps Luna complete preflight without altering the native script, app permissions or independent click-and-drag verification.\n"
+    filename: native-preflight-source.md
     v: 0.0.0
 core:packages:
   - id: npm:satelle-repository
@@ -8,7 +8,7 @@ core:packages:
   - id: npm:satelle-docs
     updated: false
   - changelogIds:
-      - native-readiness-and-repair.md
+      - native-preflight-source.md
     id: cargo:satelle
     updated: true
 npm:packages:
