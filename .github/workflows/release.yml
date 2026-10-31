@@ -31,7 +31,8 @@ on:
         type: string
 concurrency:
   group: ${{ (startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.operation == 'finalize')) && 'satelle-release-writer' || format('release-candidate-{0}', github.ref) }}
-  cancel-in-progress: false
+  # Superseded PR validation is disposable; never interrupt a release writer.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
